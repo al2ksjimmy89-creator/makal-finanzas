@@ -9,6 +9,7 @@ import streamlit as st
 
 import calculos as calc
 import db
+import logo
 import vista_config
 import vista_mes
 import vista_registro
@@ -52,8 +53,8 @@ else:
 def pantalla_acceso():
     _, centro, _ = st.columns([1, 1.3, 1])
     with centro:
-        st.html("""<div class="mk-banner" style="justify-content:center;text-align:center">
-                   <div><div class="t" style="font-size:2rem;letter-spacing:.2em">MAKAL</div>
+        st.html(f"""<div class="mk-banner" style="justify-content:center;text-align:center">
+                   <div><img src="data:image/png;base64,{logo.BLANCO_B64}" alt="MAKAL" style="height:110px">
                    <div class="s">Catering & Eventos · Finanzas</div></div></div>""")
         if not db.hay_usuarios(con):
             st.info("Primera vez: crea tu usuario de administrador.", icon=":material/person_add:")
@@ -95,8 +96,8 @@ TODOS = "Todos los clientes"
 hoy = db.hoy()
 
 with st.sidebar:
-    st.html(f"""<div class="mk-side"><div class="logo">M</div><div class="n">MAKAL</div>
-                <div class="u">{usuario} · {'Administrador' if rol == 'admin' else 'Registro'}</div></div>""")
+    st.html(f"""<div class="mk-side"><img class="logo-img" src="data:image/png;base64,{logo.BLANCO_B64}"
+                alt="MAKAL"><div class="u">{usuario} · {'Administrador' if rol == 'admin' else 'Registro'}</div></div>""")
     lista = db.clientes(con)
     activos = lista[lista["activo"] == 1]
     nombres = list(activos["nombre"]) + list(lista[lista["activo"] != 1]["nombre"])
@@ -110,28 +111,26 @@ with st.sidebar:
     cliente_nombre = st.selectbox("Cliente", opciones_cliente, key="cliente")
     cliente = None if cliente_nombre == TODOS else lista[lista["nombre"] == cliente_nombre].iloc[0]
 
-    if rol == "admin":
-        anios = sorted({hoy.year} | {int(p[:4]) for p in calc.periodos_con_datos(con)}, reverse=True)
-        anio = st.selectbox("Año", anios, key="anio")
-        con_datos = set(calc.periodos_con_datos(con, int(cliente["id"]) if cliente is not None else None))
+    anios = sorted({hoy.year} | {int(p[:4]) for p in calc.periodos_con_datos(con)}, reverse=True)
+    anio = st.selectbox("Año", anios, key="anio")
+    con_datos = set(calc.periodos_con_datos(con, int(cliente["id"]) if cliente is not None else None))
 
-        def etiqueta(opcion):
-            fijas = {REGISTRAR: ":material/add_circle: Registrar", RESUMEN: ":material/insights: Resumen total",
-                     CONFIG: ":material/settings: Configuración"}
-            if opcion in fijas:
-                return fijas[opcion]
-            per = db.periodo_de(anio, opcion)
-            color = "orange" if (anio, opcion) == (hoy.year, hoy.month) else ("blue" if per in con_datos else "gray")
-            return f":{color}[●] {calc.MESES[opcion - 1]}"
+    def etiqueta(opcion):
+        fijas = {REGISTRAR: ":material/add_circle: Registrar", RESUMEN: ":material/insights: Resumen total",
+                 CONFIG: ":material/settings: Configuración"}
+        if opcion in fijas:
+            return fijas[opcion]
+        per = db.periodo_de(anio, opcion)
+        color = "orange" if (anio, opcion) == (hoy.year, hoy.month) else ("blue" if per in con_datos else "gray")
+        return f":{color}[●] {calc.MESES[opcion - 1]}"
 
-        if "menu" not in st.session_state:
-            st.session_state["menu"] = hoy.month
-        st.radio("Menú", [REGISTRAR, RESUMEN, *range(1, 13), CONFIG], key="menu", format_func=etiqueta,
-                 label_visibility="collapsed")
-        st.caption(":orange[●] mes actual · :blue[●] con datos · :gray[●] sin datos")
-        eleccion = st.session_state["menu"]
-    else:
-        eleccion = REGISTRAR
+    # el usuario de registro registra y además mira el resumen y el dashboard/PyG de cada mes (sin editar)
+    opciones = [REGISTRAR, RESUMEN, *range(1, 13)] + ([CONFIG] if rol == "admin" else [])
+    if st.session_state.get("menu") not in opciones:
+        st.session_state["menu"] = hoy.month if rol == "admin" else REGISTRAR
+    st.radio("Menú", opciones, key="menu", format_func=etiqueta, label_visibility="collapsed")
+    st.caption(":orange[●] mes actual · :blue[●] con datos · :gray[●] sin datos")
+    eleccion = st.session_state["menu"]
 
     st.divider()
     if st.button("Cerrar sesión", icon=":material/logout:", width="stretch"):
@@ -153,4 +152,4 @@ elif cliente is None:
 elif eleccion == REGISTRAR:
     vista_registro.mostrar(con, cliente, usuario)
 else:
-    vista_mes.mostrar(con, cliente, db.periodo_de(anio, eleccion))
+    vista_mes.mostrar(con, cliente, db.periodo_de(anio, eleccion), solo_lectura=rol != "admin")

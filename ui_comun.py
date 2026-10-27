@@ -61,10 +61,7 @@ CSS = f"""
 .st-key-pestanas [role="tab"]::after {{display:none}}
 /* Encabezado del menú lateral */
 .mk-side {{text-align:center; padding:6px 0 4px}}
-.mk-side .logo {{width:64px; height:64px; border-radius:50%; margin:0 auto 6px;
-  background:linear-gradient(135deg,{CIAN},{ROSA}); display:flex; align-items:center; justify-content:center;
-  font-size:1.8rem; font-weight:800; color:#fff}}
-.mk-side .n {{font-weight:700; letter-spacing:.12em}}
+.mk-side .logo-img {{width:96px; display:block; margin:0 auto 8px}}
 .mk-side .u {{font-size:.8rem; opacity:.75}}
 /* Tabla PyG */
 .pyg {{width:100%; border-collapse:collapse; font-size:.92rem; background:#fff; border-radius:14px; overflow:hidden}}

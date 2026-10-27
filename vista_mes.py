@@ -37,7 +37,8 @@ def _a_fecha(serie):
 
 # ================================================================ entrada principal
 
-def mostrar(con, cliente, periodo):
+def mostrar(con, cliente, periodo, solo_lectura=False):
+    """solo_lectura: para el usuario de registro, que solo mira el Dashboard y el PyG."""
     cid = int(cliente["id"])
     corte_auto = calc.dia_corte(periodo)
 
@@ -60,6 +61,13 @@ def mostrar(con, cliente, periodo):
                              "proporcional a este día.")
 
     pestanas = st.container(key="pestanas")
+    if solo_lectura:
+        tabs = pestanas.tabs([":material/dashboard: Dashboard", ":material/request_quote: PyG"])
+        with tabs[0]:
+            dashboard(con, cliente, periodo, r)
+        with tabs[1]:
+            pestaña_pyg(con, cliente, periodo, r)
+        return
     tabs = pestanas.tabs([":material/dashboard: Dashboard", ":material/request_quote: PyG",
                           ":material/restaurant: Ventas", ":material/shopping_basket: Materia prima",
                           ":material/groups: Mano de obra", ":material/receipt_long: Otros gastos",
@@ -111,21 +119,16 @@ def dashboard(con, cliente, periodo, r):
         tarjeta(c[3], "Financiamiento", dinero(r["total_fin"]), "abonos / cuotas del mes", "blanco")
 
     g1, g2 = st.columns([3, 2])
-    diario = db.df(con, """SELECT fecha, SUM(cantidad*precio) AS venta FROM raciones
-                           WHERE cliente_id=? AND periodo=? GROUP BY fecha ORDER BY fecha""",
-                   (int(cliente["id"]), periodo))
-    compras = db.df(con, """SELECT g.fecha, SUM(g.monto) AS compra FROM gastos g JOIN categorias c
-                            ON c.id=g.categoria_id WHERE g.cliente_id=? AND g.periodo=? AND c.seccion='MP'
-                            GROUP BY g.fecha""", (int(cliente["id"]), periodo))
-    with g1.container(border=True, key="caja_d_diario"):
-        fig = go.Figure()
-        if len(diario):
-            fig.add_scatter(x=diario["fecha"], y=diario["venta"], name="Ventas del día", fill="tozeroy",
-                            line=dict(color=CIAN, width=3, shape="spline"), fillcolor="rgba(20,194,236,.15)")
-        if len(compras):
-            fig.add_scatter(x=compras["fecha"], y=compras["compra"], name="Compras de materia prima",
-                            mode="lines+markers", line=dict(color=ROSA, width=2.5, shape="spline"))
-        st.plotly_chart(estilo_figura(fig.update_layout(title="Ventas y compras por día")), width="stretch")
+    pct_mp = ppto.get("Materia Prima", 0)
+    sem = calc.semanas_consumo(con, int(cliente["id"]), periodo, pct_mp)
+    with g1.container(border=True, key="caja_d_semanal"):
+        if len(sem):
+            st.plotly_chart(grafico_ventas_vs_mp(sem, pct_mp, "Semana a semana: ventas vs materia prima"),
+                            width="stretch")
+            st.caption("Semanas de jueves a miércoles. Los pedidos de martes y miércoles cuentan en la semana "
+                       "siguiente, que es cuando se consumen. Encima de cada barra rosa: % de las ventas de la semana.")
+        else:
+            st.info("Aún no hay ventas ni compras este mes.")
     with g2.container(border=True, key="caja_d_dona"):
         st.plotly_chart(dona(["Materia prima", "Mano de obra", "Indirectos"],
                              [r["total_mp"], r["total_mo"], r["indirectos"]], "Distribución de costos"),
@@ -141,15 +144,17 @@ def dashboard(con, cliente, periodo, r):
                         line=dict(color=GRIS, dash="dash"), name=f"Meta utilidad ({porcentaje(meta)})")
         st.plotly_chart(estilo_figura(fig.update_layout(title="Resumen financiero")), width="stretch")
     mp = r["categorias"][r["categorias"]["seccion"] == db.MP]
-    pct_mp = ppto.get("Materia Prima", 0)
     if len(mp):
         presup = [tv * pct_mp * ppto.get(n, 0) for n in mp["nombre"]]
         with g2.container(border=True, key="caja_d_mp"):
             fig = go.Figure()
             fig.add_bar(y=mp["nombre"], x=presup, orientation="h", name="Presupuesto", marker_color="#DDE3EA")
-            fig.add_bar(y=mp["nombre"], x=mp["monto"], orientation="h", name="Real",
-                        marker_color=[ROSA if real > p > 0 else CIAN for real, p in zip(mp["monto"], presup)],
-                        text=[dinero(v, 0) for v in mp["monto"]], textposition="outside")
+            # barra "Real" siempre del mismo color; si pasa el presupuesto, el texto lo dice en rosa
+            fig.add_bar(y=mp["nombre"], x=mp["monto"], orientation="h", name="Real", marker_color=CIAN,
+                        text=[dinero(v, 0) + (f"  ▲ {dinero(v - p, 0)}" if v > p > 0 else "")
+                              for v, p in zip(mp["monto"], presup)],
+                        textposition="outside",
+                        textfont=dict(color=[ROSA if v > p > 0 else NEGRO for v, p in zip(mp["monto"], presup)]))
             fig.update_layout(title="Materia prima por bodega: real vs presupuesto", barmode="group")
             fig = estilo_figura(fig)
             fig.update_yaxes(tickprefix=None)
@@ -183,7 +188,8 @@ def pestaña_pyg(con, cliente, periodo, r):
     st.caption(f"Análisis al día {r['corte']} de 30. Sueldos y gastos fijos proporcionales al día de corte. "
                "La columna Presupuesto es el % sobre ventas asignado al cliente.")
     exportar = t[t["Monto"].notna()][["Concepto", "Monto", "% Ventas"]]
-    descargar_excel({"PyG": exportar, "Rol de pagos": r["rol"].drop(columns=["empleado_id"], errors="ignore")},
+    descargar_excel({"PyG": exportar, "Rol de pagos": r["rol"].drop(columns=["empleado_id", "detalle_descuentos"],
+                                                                       errors="ignore")},
                     f"PyG_{cliente['nombre']}_{periodo}.xlsx".replace(" ", "_"))
 
 
@@ -415,86 +421,107 @@ def editor_gastos(con, cid, periodo, secciones, clave, proveedores_secciones=Non
     return datos
 
 
-def _semana_del_mes(fecha, periodo):
-    """Semanas fijas del mes: 1-7, 8-14, 15-21, 22-28, 29-31. Fechas de otro mes van a la primera/última."""
-    a, m = map(int, periodo.split("-"))
-    f = pd.Timestamp(fecha)
-    dia = 1 if (f.year, f.month) < (a, m) else (31 if (f.year, f.month) > (a, m) else f.day)
-    return min((dia - 1) // 7 + 1, 5)
+ICONOS_BODEGA = {"Vegetales": ":material/eco:", "Abastos": ":material/inventory_2:",
+                 "Proteínas": ":material/set_meal:", "Desechables": ":material/takeout_dining:",
+                 "Pulpas": ":material/blender:", "Pan": ":material/bakery_dining:",
+                 "Combustible / Gas (GLP)": ":material/propane_tank:"}
 
 
-ETIQUETA_SEMANA = {1: "Sem 1 (1-7)", 2: "Sem 2 (8-14)", 3: "Sem 3 (15-21)", 4: "Sem 4 (22-28)", 5: "Sem 5 (29-31)"}
-
-
-def grafico_compras_semana(con, cid, periodo, datos, pct_mp):
-    """Compras de materia prima por semana (apiladas por bodega) con el total, y la línea del presupuesto
-    (pct_mp de las ventas de esa semana). Debajo, el acumulado del mes contra el presupuesto acumulado."""
-    d = datos.dropna(subset=["fecha", "monto"]).copy()
-    d["sem"] = [_semana_del_mes(f, periodo) for f in d["fecha"]]
-    ventas = db.df(con, """SELECT fecha, SUM(monto) AS venta FROM (
-                             SELECT fecha, cantidad*precio AS monto FROM raciones WHERE cliente_id=? AND periodo=?
-                             UNION ALL SELECT fecha, monto FROM ventas_extra WHERE cliente_id=? AND periodo=?) AS v
-                           GROUP BY fecha""", (cid, periodo, cid, periodo))
-    ventas["sem"] = [_semana_del_mes(f, periodo) for f in ventas["fecha"]]
-    semanas = [s for s in range(1, 6) if s in set(d["sem"]) | set(ventas["sem"])]
-    if not semanas:
-        return
-    x = [ETIQUETA_SEMANA[s] for s in semanas]
-    compras = d.groupby("sem")["monto"].sum().reindex(semanas, fill_value=0)
-    presup = ventas.groupby("sem")["venta"].sum().reindex(semanas, fill_value=0) * pct_mp
-
+def grafico_ventas_vs_mp(sem, pct_mp, titulo):
+    """Por semana de consumo: ventas (cian) y compras de materia prima (rosa), con el % que representa
+    la materia prima sobre las ventas y la línea del presupuesto."""
     fig = go.Figure()
-    for i, (bodega, g) in enumerate(d.groupby("categoria", sort=False)):
-        fig.add_bar(x=x, y=g.groupby("sem")["monto"].sum().reindex(semanas, fill_value=0), name=bodega,
-                    marker_color=COLORES_BODEGA.get(bodega, PALETA[i % len(PALETA)]))
-    fig.add_scatter(x=x, y=compras, mode="text", text=[f"<b>{dinero(v, 0)}</b>" for v in compras],
-                    textposition="top center", showlegend=False, hoverinfo="skip",
-                    textfont=dict(color=[ROSA if c > p > 0 else NEGRO for c, p in zip(compras, presup)], size=13))
-    fig.add_scatter(x=x, y=presup, name=f"Presupuesto MP ({porcentaje(pct_mp)} de ventas)", mode="lines+markers",
-                    line=dict(color=NEGRO, width=3, shape="spline", dash="dot"),
-                    marker=dict(size=9, color=[ROSA if c > p > 0 else CIAN for c, p in zip(compras, presup)],
-                                line=dict(color="white", width=2)))
-    fig.update_layout(title="Compras de materia prima por semana", barmode="stack",
-                      yaxis_range=[0, max(compras.max(), presup.max()) * 1.18])
+    fig.add_bar(x=sem["etiqueta"], y=sem["Ventas"], name="Ventas", marker_color=CIAN,
+                text=[dinero(v, 0) for v in sem["Ventas"]], textposition="inside", insidetextanchor="end",
+                textfont=dict(color="white"))
+    fig.add_bar(x=sem["etiqueta"], y=sem["Compras MP"], name="Materia prima", marker_color=ROSA,
+                text=[f"<b>{porcentaje(p)}</b>" if v else "" for p, v in zip(sem["% de ventas"], sem["Ventas"])],
+                textposition="outside")
+    fig.add_scatter(x=sem["etiqueta"], y=sem["Presupuesto"], name=f"Presupuesto MP ({porcentaje(pct_mp)} de ventas)",
+                    mode="lines+markers", line=dict(color=NEGRO, width=2, dash="dot"), marker=dict(size=7))
+    fig.update_layout(title=titulo, barmode="group")
+    return estilo_figura(fig, 360)
+
+
+def grafico_compras_semana(sem, pct_mp):
+    """Compras de materia prima por semana de consumo, apiladas por bodega, con el total encima
+    (en rosa si pasa el presupuesto) y la línea del presupuesto. Debajo, el acumulado."""
+    bodegas = [b for b in COLORES_BODEGA if b in sem.columns]
+    fig = go.Figure()
+    for b in bodegas:
+        fig.add_bar(x=sem["etiqueta"], y=sem[b], name=b, marker_color=COLORES_BODEGA[b])
+    exc = [c > p > 0 for c, p in zip(sem["Compras MP"], sem["Presupuesto"])]
+    fig.add_scatter(x=sem["etiqueta"], y=sem["Compras MP"], mode="text", showlegend=False, hoverinfo="skip",
+                    text=[f"<b>{dinero(v, 0)}</b>" for v in sem["Compras MP"]], textposition="top center",
+                    textfont=dict(color=[ROSA if e else NEGRO for e in exc], size=13))
+    fig.add_scatter(x=sem["etiqueta"], y=sem["Presupuesto"], name=f"Presupuesto ({porcentaje(pct_mp)} de ventas)",
+                    mode="lines+markers", line=dict(color=NEGRO, width=3, dash="dot"),
+                    marker=dict(size=9, color=[ROSA if e else CIAN for e in exc], line=dict(color="white", width=2)))
+    tope = max(sem["Compras MP"].max(), sem["Presupuesto"].max()) or 1
+    fig.update_layout(title="Compras de materia prima por semana (jueves a miércoles)", barmode="stack",
+                      yaxis_range=[0, tope * 1.2])
     with st.container(border=True, key="caja_g_semana"):
         st.plotly_chart(estilo_figura(fig, 400), width="stretch")
-        excedidas = [ETIQUETA_SEMANA[s] for s, c, p in zip(semanas, compras, presup) if c > p > 0]
-        if excedidas:
-            st.caption(md(f":red[**Sobre el presupuesto:**] {', '.join(excedidas)}. El total de la semana en rosa "
-                          "indica que se compró más del % asignado sobre lo vendido esa semana."))
+        st.caption("Cada semana va de jueves a miércoles. Los pedidos de martes y miércoles se suman a la semana "
+                   "que empieza el jueves siguiente. Total en rosa = se compró más de lo presupuestado para lo "
+                   "vendido esa semana.")
 
-    acum_c, acum_p = compras.cumsum(), presup.cumsum()
     fig = go.Figure()
-    fig.add_scatter(x=x, y=acum_p, name="Presupuesto acumulado", line=dict(color=CIAN, width=3, shape="spline"),
-                    fill="tozeroy", fillcolor="rgba(31,200,240,.12)")
-    fig.add_scatter(x=x, y=acum_c, name="Compras acumuladas", mode="lines+markers+text",
-                    line=dict(color=ROSA, width=3, shape="spline"), text=[dinero(v, 0) for v in acum_c],
-                    textposition="top left")
-    fig.update_layout(title="Acumulado del mes: compras vs presupuesto")
+    fig.add_scatter(x=sem["etiqueta"], y=sem["Presupuesto"].cumsum(), name="Presupuesto acumulado", fill="tozeroy",
+                    line=dict(color=CIAN, width=3, shape="spline"), fillcolor="rgba(20,194,236,.12)")
+    fig.add_scatter(x=sem["etiqueta"], y=sem["Compras MP"].cumsum(), name="Compras acumuladas",
+                    mode="lines+markers+text", line=dict(color=ROSA, width=3, shape="spline"),
+                    text=[dinero(v, 0) for v in sem["Compras MP"].cumsum()], textposition="top left")
+    fig.update_layout(title="Acumulado: compras vs presupuesto")
     with st.container(border=True, key="caja_g_acum"):
         st.plotly_chart(estilo_figura(fig, 320), width="stretch")
 
 
+def tabla_semanal(sem):
+    bodegas = [b for b in COLORES_BODEGA if b in sem.columns]
+    t = sem[["Semana", "Ventas", *bodegas, "Compras MP", "Presupuesto", "Diferencia", "% de ventas"]]
+    formatos = {c: dinero for c in ["Ventas", *bodegas, "Compras MP", "Presupuesto", "Diferencia"]}
+    formatos["% de ventas"] = porcentaje
+    estilo = (t.style
+              .format(formatos)
+              .map(lambda v: f"color: {ROSA}; font-weight: 700" if v < 0 else f"color: {VERDE}",
+                   subset=["Diferencia"])
+              .set_properties(subset=["Compras MP"], **{"font-weight": "700"}))
+    with st.container(border=True, key="caja_t_semanal"):
+        st.markdown("**Cuadre semanal de materia prima**")
+        st.dataframe(estilo, hide_index=True, width="stretch", alt="Cuadre semanal de materia prima")
+        st.caption("Diferencia = presupuesto − compras. En rosa: la semana gastó más de lo presupuestado.")
+
+
 def pestaña_materia_prima(con, cid, periodo, r):
     ppto = db.presupuesto(con, cid)
+    pct_mp = ppto.get("Materia Prima", 0.45)
     mp = r["categorias"][r["categorias"]["seccion"] == db.MP]
-    base = r["total_ventas"] * ppto.get("Materia Prima", 0)
+    base = r["total_ventas"] * pct_mp
+    sem = calc.semanas_consumo(con, cid, periodo, pct_mp)
     with st.container(horizontal=True):
         for _, f in mp.iterrows():
             limite = base * ppto.get(f["nombre"], 0)
             dif = limite - f["monto"]
+            serie = list(sem[f["nombre"]]) if f["nombre"] in sem.columns else None
             st.metric(f["nombre"], dinero(f["monto"], 0),
                       f"{'quedan' if dif >= 0 else 'excede'} {dinero(abs(dif), 0)}" if limite else None,
-                      delta_color="normal" if dif >= 0 else "inverse", delta_arrow="off", border=True)
+                      delta_color="normal" if dif >= 0 else "inverse", delta_arrow="off", border=True,
+                      icon=ICONOS_BODEGA.get(f["nombre"]), chart_data=serie, chart_type="bar",
+                      help=f"Presupuesto del mes: {dinero(limite)} ({porcentaje(ppto.get(f['nombre'], 0))} de la "
+                           f"materia prima). El minigráfico muestra las compras de cada semana.")
         st.metric("Total materia prima", dinero(r["total_mp"], 0), f"presupuesto {dinero(base, 0)}",
-                  delta_color="off", delta_arrow="off", border=True)
+                  delta_color="off", delta_arrow="off", border=True, icon=":material/shopping_basket:",
+                  chart_data=list(sem["Compras MP"]) if len(sem) else None, chart_type="bar")
 
     clave = f"mp_{cid}_{periodo}"
     form_registro_gasto(con, cid, periodo, [db.MP], clave, "Registrar compra")
     datos = editor_gastos(con, cid, periodo, [db.MP], clave, [db.MP])
 
+    if len(sem):
+        tabla_semanal(sem)
+        grafico_compras_semana(sem, pct_mp)
     if len(datos):
-        grafico_compras_semana(con, cid, periodo, datos, ppto.get("Materia Prima", 0.45))
         prov = datos.fillna({"proveedor": "Sin proveedor"}).groupby("proveedor")["monto"].sum().sort_values()
         fig = go.Figure(go.Bar(x=prov.values, y=prov.index, orientation="h", marker_color=CIAN,
                                text=[dinero(v, 0) for v in prov.values], textposition="outside"))
@@ -509,7 +536,7 @@ def pestaña_otros_gastos(con, cid, periodo, r):
     if len(otros):
         with st.container(horizontal=True):
             for _, f in otros.iterrows():
-                st.metric(f["nombre"], dinero(f["monto"]), border=True)
+                st.metric(f["nombre"], dinero(f["monto"]), border=True, icon=ICONOS_BODEGA.get(f["nombre"]))
     clave = f"og_{cid}_{periodo}"
     form_registro_gasto(con, cid, periodo, [db.IND, db.MANT, db.FIN], clave, "Registrar gasto")
     editor_gastos(con, cid, periodo, [db.IND, db.MANT, db.FIN], clave)
@@ -524,6 +551,47 @@ def pestaña_otros_gastos(con, cid, periodo, r):
 
 
 # ================================================================ mano de obra
+
+def tabla_rol(rol):
+    """Rol del mes: oculta las columnas que están en cero para todos (ej. aportes, si todos son por
+    prestación de servicios) y resalta en negrita lo que se le paga a cada uno."""
+    vista = rol.drop(columns=["empleado_id", "detalle_descuentos", "Cédula"], errors="ignore")
+    texto = ["Nombre", "Cargo", "Contrato"]
+    siempre = ["Sueldo", "Días", "Sueldo proporcional", "Costo empresa", "Neto a pagar"]
+    vista = vista[[c for c in vista.columns if c in texto or c in siempre or vista[c].abs().sum() > 0.004]]
+    dinero_cols = [c for c in vista.columns if c not in texto and c != "Días"]
+    formatos = {c: dinero for c in dinero_cols}
+    formatos["Días"] = "{:g}"
+    estilo = (vista.style
+              .format(formatos)
+              .set_properties(subset=["Neto a pagar"], **{"font-weight": "800", "color": NEGRO,
+                                                          "background-color": "#E8F8FD"})
+              .set_properties(subset=["Nombre"], **{"font-weight": "600"}))
+    st.dataframe(estilo, hide_index=True, width="stretch", alt="Rol de pagos del mes")
+    st.caption("Costo empresa = lo que va al PyG. Neto a pagar = lo que recibe cada persona (después de "
+               "descuentos y adelantos).")
+
+
+def descargas_rol(con, cid, periodo, rol):
+    """Roles de pago individuales en PDF para enviar a cada colaborador."""
+    import rol_pdf
+    if not len(rol):
+        return
+    with st.container(border=True, key="caja_roles_pdf"):
+        st.markdown("**Roles de pago individuales**")
+        st.caption("Un PDF por colaborador con el detalle de su pago, para enviarle por WhatsApp o correo.")
+        cliente = db.valor(con, "SELECT nombre FROM clientes WHERE id=?", (cid,))
+        st.download_button("Descargar todos (ZIP)", rol_pdf.zip_roles(rol, periodo, cliente), type="primary",
+                           file_name=f"Roles_{periodo}.zip", mime="application/zip", icon=":material/folder_zip:",
+                           key=f"zip_{periodo}")
+        with st.expander("Descargar uno por uno"):
+            for _, f in rol.iterrows():
+                c1, c2 = st.columns([3, 1], vertical_alignment="center")
+                c1.write(md(f"{f['Nombre']} · neto {dinero(f['Neto a pagar'])}"))
+                c2.download_button("PDF", rol_pdf.pdf_rol(f, periodo, cliente), icon=":material/picture_as_pdf:",
+                                   file_name=rol_pdf.nombre_archivo(f, periodo), mime="application/pdf",
+                                   key=f"pdf_{periodo}_{f['empleado_id']}")
+
 
 def pestaña_mano_obra(con, cid, periodo, r):
     rol = r["rol"]
@@ -540,12 +608,10 @@ def pestaña_mano_obra(con, cid, periodo, r):
     st.write("")
 
     if cerrado:
-        st.success("🔒 Rol de este mes **cerrado**: se usan los días y sueldos guardados al cerrarlo.")
+        st.success("Rol de este mes **cerrado**: se usan los días y sueldos guardados al cerrarlo.",
+                   icon=":material/lock:")
     if len(rol):
-        vista = rol.drop(columns=["empleado_id"])
-        st.dataframe(vista, hide_index=True, width="stretch", column_config={
-            c: st.column_config.NumberColumn(format="$%.2f") for c in vista.columns
-            if c not in ("Nombre", "Cargo", "Contrato", "Días")})
+        tabla_rol(rol)
 
     if not cerrado:
         with st.expander("✏️ Novedades del mes (días distintos, horas extras)"):
@@ -557,7 +623,8 @@ def pestaña_mano_obra(con, cid, periodo, r):
 
     st.divider()
     if cerrado:
-        if st.button("🔓 Reabrir rol de este mes"):
+        descargas_rol(con, cid, periodo, rol)
+        if st.button("Reabrir rol de este mes", icon=":material/lock_open:"):
             calc.reabrir_rol(con, cid, periodo)
             _guardado(f"mo_{cid}", "Rol reabierto")
     else:
@@ -613,9 +680,9 @@ def editor_descuentos(con, cid, periodo):
                           ORDER BY d.periodo_inicio DESC, d.id""", (cid,))
     datos.insert(1, "Empleado", datos["empleado_id"].map(etiqueta))
     datos = datos.drop(columns=["empleado_id"])
-    st.caption("**Adelanto de sueldo**: solo baja lo que se le paga. **Recupera gasto de la empresa** (ej. zapatos "
-               "que pagó la empresa y descuenta al trabajador): además resta del costo de mano de obra, para no "
-               "contar el gasto dos veces. Un descuento en varias cuotas se reparte solo en los meses siguientes.")
+    st.caption("Los descuentos son solo de manejo interno: bajan lo que se le paga al trabajador, pero **no "
+               "cambian el PyG**. Lo que la empresa compró por él (ej. zapatos) se registra en Gastos varios. "
+               "Un descuento en varias cuotas se reparte solo en los meses siguientes.")
     clave = f"desc_{cid}"
     editado = st.data_editor(
         datos, hide_index=True, width="stretch", num_rows="dynamic", key=f"{clave}_{_version(clave)}",

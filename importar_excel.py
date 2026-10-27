@@ -421,7 +421,7 @@ def importar_archivo(con, ruta, nombre_cliente, periodo, hoy=None):
                         (eid, periodo, round(dias30, 4), e["sueldo"], e["bono"]))
         if e["descuento"]:
             nota = e["nota_descuento"]
-            tipo = "Recupera gasto de la empresa" if any(x in norm(nota) for x in ("dotacion", "calzado")) \
+            tipo = "Descuento por dotación / compras" if any(x in norm(nota) for x in ("dotacion", "calzado")) \
                 else "Adelanto de sueldo"
             con.execute("""INSERT INTO descuentos (empleado_id, periodo_inicio, tipo, motivo, monto_total, cuotas)
                            VALUES (?,?,?,?,?,1)""", (eid, periodo, tipo, nota or "Importado de Excel", e["descuento"]))

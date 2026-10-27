@@ -7,7 +7,7 @@ Ventas y compras se toman tal como se registraron. Lo que es "por mes"
 (sueldos, bonos, gastos fijos) se calcula proporcional al día de corte.
 """
 from calendar import monthrange
-from datetime import date
+from datetime import date, timedelta
 
 import pandas as pd
 
@@ -101,14 +101,18 @@ def rol_de_pagos(con, cliente_id, periodo, corte):
         sueldo = de_novedad("sueldo") if de_novedad("sueldo") is not None else (e["sueldo"] or 0)
         bono_fijo = de_novedad("bono")  # bono ya pagado en un mes cerrado (no se prorratea)
 
+        # Descuentos: solo bajan lo que se paga al trabajador. No cambian el costo del PyG
+        # (lo que la empresa compró por él ya está en Gastos varios).
         cuotas_mes = []
         for _, d in desc[desc["empleado_id"] == e["id"]].iterrows():
             cuotas = max(int(d["cuotas"] or 1), 1)
             for i in range(cuotas):
                 if db.sumar_meses(d["periodo_inicio"], i) == periodo:
-                    cuotas_mes.append((d["tipo"], d["monto_total"] / cuotas))
+                    detalle = d["motivo"] or d["tipo"]
+                    if cuotas > 1:
+                        detalle += f" (cuota {i + 1} de {cuotas})"
+                    cuotas_mes.append((detalle, d["monto_total"] / cuotas))
         descuento_total = sum(v for _, v in cuotas_mes)
-        recupera = sum(v for t, v in cuotas_mes if t == "Recupera gasto de la empresa")
 
         if dias <= 0 and extras == 0 and descuento_total == 0:
             continue
@@ -129,15 +133,74 @@ def rol_de_pagos(con, cliente_id, periodo, corte):
 
         devengado = sueldo_p + bono_p + extras
         filas.append({
-            "empleado_id": e["id"], "Nombre": e["nombre"], "Cargo": e["cargo"],
+            "empleado_id": e["id"], "Nombre": e["nombre"], "Cargo": e["cargo"], "Cédula": e["cedula"],
             "Contrato": e["tipo_contrato"], "Sueldo": sueldo, "Días": round(dias, 2),
             "Sueldo proporcional": sueldo_p, "Bono": bono_p, "Extras": extras,
             "Aporte patronal": iess, "Décimos": d13 + d14, "Vacaciones": vac, "Fondos reserva": fondos,
-            "Descuentos": descuento_total, "Recupera gasto": recupera,
-            "Costo empresa": devengado + iess + d13 + d14 + vac + fondos - recupera,
+            "IESS personal": iess_personal, "Descuentos": descuento_total,
+            "Costo empresa": devengado + iess + d13 + d14 + vac + fondos,
             "Neto a pagar": devengado - iess_personal - descuento_total,
+            "detalle_descuentos": cuotas_mes,
         })
     return pd.DataFrame(filas)
+
+
+# ---------------------------------------------------------------- semanas de consumo (jueves a miércoles)
+
+DIAS_CORTOS = ["Lun", "Mar", "Mié", "Jue", "Vie", "Sáb", "Dom"]
+
+
+def inicio_semana_consumo(d):
+    """Jueves en que empieza la semana de consumo de una fecha (semanas de jueves a miércoles)."""
+    return d - timedelta(days=(d.weekday() - 3) % 7)
+
+
+def semana_de_compra(d):
+    """Los pedidos de martes y miércoles se consumen desde el jueves siguiente."""
+    if d.weekday() in (1, 2):
+        return d + timedelta(days=3 - d.weekday())
+    return inicio_semana_consumo(d)
+
+
+def semanas_consumo(con, cliente_id, periodo, pct_mp):
+    """Semanas de jueves a miércoles que tocan el mes: ventas de esos días, compras de materia prima
+    asignadas a la semana en que se consumen (por bodega), y el presupuesto (pct_mp de las ventas)."""
+    a, m = map(int, periodo.split("-"))
+    primero, ultimo = date(a, m, 1), date(a, m, monthrange(a, m)[1])
+    desde, hasta = (primero - timedelta(days=10)).isoformat(), (ultimo + timedelta(days=10)).isoformat()
+    compras = db.df(con, """SELECT g.fecha, c.nombre AS bodega, g.monto FROM gastos g
+                            JOIN categorias c ON c.id=g.categoria_id
+                            WHERE g.cliente_id=? AND c.seccion='MP' AND g.fecha BETWEEN ? AND ?""",
+                    (cliente_id, desde, hasta))
+    ventas_dia = db.df(con, """SELECT fecha, SUM(monto) AS venta FROM (
+                                 SELECT fecha, cantidad*precio AS monto FROM raciones WHERE cliente_id=?
+                                 UNION ALL SELECT fecha, monto FROM ventas_extra WHERE cliente_id=?) AS v
+                               WHERE fecha BETWEEN ? AND ? GROUP BY fecha""",
+                       (cliente_id, cliente_id, desde, hasta))
+    compras["semana"] = [semana_de_compra(date.fromisoformat(f[:10])) for f in compras["fecha"]]
+    ventas_dia["semana"] = [inicio_semana_consumo(date.fromisoformat(f[:10])) for f in ventas_dia["fecha"]]
+
+    tope = min(ultimo, db.hoy())  # no mostrar semanas que todavía no empiezan
+    semanas = sorted({inicio_semana_consumo(primero) + timedelta(days=7 * i) for i in range(6)
+                      if inicio_semana_consumo(primero) + timedelta(days=7 * i) <= tope})
+    filas = []
+    for s in semanas:
+        fin = s + timedelta(days=6)
+        c = compras[compras["semana"] == s]
+        fila = {"inicio": s, "fin": fin,
+                "Semana": f"Jue {s:%d/%m} – Mié {fin:%d/%m}",
+                "etiqueta": f"Jue {s:%d/%m}<br>Mié {fin:%d/%m}",
+                "Ventas": float(ventas_dia.loc[ventas_dia["semana"] == s, "venta"].sum())}
+        for bodega, monto in c.groupby("bodega")["monto"].sum().items():
+            fila[bodega] = float(monto)
+        fila["Compras MP"] = float(c["monto"].sum())
+        filas.append(fila)
+    t = pd.DataFrame(filas).fillna(0.0)
+    if len(t):
+        t["Presupuesto"] = t["Ventas"] * pct_mp
+        t["Diferencia"] = t["Presupuesto"] - t["Compras MP"]
+        t["% de ventas"] = [pct(c, v) for c, v in zip(t["Compras MP"], t["Ventas"])]
+    return t
 
 
 # ---------------------------------------------------------------- ventas
@@ -209,7 +272,6 @@ def pyg(con, cliente_id, periodo, corte=None):
         "Beneficios sociales (décimos)": float(rol["Décimos"].sum()) if len(rol) else 0.0,
         "Vacaciones": float(rol["Vacaciones"].sum()) if len(rol) else 0.0,
         "Fondos de reserva": float(rol["Fondos reserva"].sum()) if len(rol) else 0.0,
-        "(−) Gastos recuperados del personal": -float(rol["Recupera gasto"].sum()) if len(rol) else 0.0,
     }
     total_mo = sum(mo.values())
 

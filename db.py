@@ -50,7 +50,7 @@ NOMBRE_SECCION = {
 }
 
 TIPOS_CONTRATO = ["Prestación de servicios", "Relación de dependencia"]
-TIPOS_DESCUENTO = ["Adelanto de sueldo", "Recupera gasto de la empresa", "Otro descuento"]
+TIPOS_DESCUENTO = ["Adelanto de sueldo", "Descuento por dotación / compras", "Otro descuento"]
 TIPOS_VENTA_EXTRA = ["Personal externo", "Evento extra", "Otra venta"]
 FORMAS_PAGO = ["Transferencia", "Efectivo", "Tarjeta", "Crédito"]
 
@@ -430,6 +430,9 @@ def inicializar():
     _asegurar_columna(con, "gastos", "registrado_por", "TEXT")
     _asegurar_columna(con, "ventas_extra", "registrado_por", "TEXT")
     _asegurar_columna(con, "raciones", "registrado_por", "TEXT")
+    # el tipo "Recupera gasto" ya no resta del costo: se renombra para que no confunda
+    con.execute("UPDATE descuentos SET tipo='Descuento por dotación / compras' "
+                "WHERE tipo='Recupera gasto de la empresa'")
     con.commit()
     return con
 
