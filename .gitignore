@@ -1,0 +1,17 @@
+# Nunca subir datos ni claves
+datos/
+respaldos/
+.streamlit/secrets.toml
+*.db
+*.db-wal
+*.db-shm
+*.xlsx
+*.xlsm
+__pycache__/
+.claude/
+.agents/
+# herramientas que solo se usan en la computadora
+cargar_historial.py
+migrar_a_supabase.py
+probar_nube.py
+makal.ico

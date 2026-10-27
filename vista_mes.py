@@ -503,16 +503,14 @@ def pestaña_materia_prima(con, cid, periodo, r):
         for _, f in mp.iterrows():
             limite = base * ppto.get(f["nombre"], 0)
             dif = limite - f["monto"]
-            serie = list(sem[f["nombre"]]) if f["nombre"] in sem.columns else None
             st.metric(f["nombre"], dinero(f["monto"], 0),
                       f"{'quedan' if dif >= 0 else 'excede'} {dinero(abs(dif), 0)}" if limite else None,
                       delta_color="normal" if dif >= 0 else "inverse", delta_arrow="off", border=True,
-                      icon=ICONOS_BODEGA.get(f["nombre"]), chart_data=serie, chart_type="bar",
+                      icon=ICONOS_BODEGA.get(f["nombre"]),
                       help=f"Presupuesto del mes: {dinero(limite)} ({porcentaje(ppto.get(f['nombre'], 0))} de la "
-                           f"materia prima). El minigráfico muestra las compras de cada semana.")
+                           f"materia prima).")
         st.metric("Total materia prima", dinero(r["total_mp"], 0), f"presupuesto {dinero(base, 0)}",
-                  delta_color="off", delta_arrow="off", border=True, icon=":material/shopping_basket:",
-                  chart_data=list(sem["Compras MP"]) if len(sem) else None, chart_type="bar")
+                  delta_color="off", delta_arrow="off", border=True, icon=":material/shopping_basket:")
 
     clave = f"mp_{cid}_{periodo}"
     form_registro_gasto(con, cid, periodo, [db.MP], clave, "Registrar compra")
