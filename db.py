@@ -198,6 +198,7 @@ CREATE TABLE IF NOT EXISTS novedades_rol (
     empleado_id INTEGER NOT NULL REFERENCES empleados(id),
     periodo TEXT NOT NULL,
     dias REAL,                         -- vacío = automático
+    descuento REAL,                    -- descuento del mes escrito en la nómina (vacío = cuotas)
     extras REAL DEFAULT 0,             -- horas extras u otros pagos
     sueldo REAL,                       -- se llena al cerrar el mes (sueldo de ese mes)
     bono REAL,                         -- se llena al cerrar el mes (bono pagado ese mes)
@@ -209,6 +210,7 @@ CREATE TABLE IF NOT EXISTS roles_cerrados (
     cliente_id INTEGER NOT NULL REFERENCES clientes(id),
     periodo TEXT NOT NULL,
     fecha_cierre TEXT,
+    dias_base REAL,                    -- días que tuvo el mes (base del proporcional)
     PRIMARY KEY (cliente_id, periodo)
 );
 CREATE TABLE IF NOT EXISTS descuentos (
@@ -223,7 +225,6 @@ CREATE TABLE IF NOT EXISTS descuentos (
 """
 
 PARAMETROS_INICIALES = [
-    ("dias_base", 30, "Días que se consideran por mes (siempre 30)"),
     ("sbu", 482, "Salario básico unificado vigente"),
     ("iess_patronal", 0.1215, "Aporte patronal IESS (solo relación de dependencia)"),
     ("iess_personal", 0.0945, "Aporte personal IESS (se descuenta del neto)"),
@@ -430,6 +431,10 @@ def inicializar():
     _asegurar_columna(con, "gastos", "registrado_por", "TEXT")
     _asegurar_columna(con, "ventas_extra", "registrado_por", "TEXT")
     _asegurar_columna(con, "raciones", "registrado_por", "TEXT")
+    _asegurar_columna(con, "novedades_rol", "descuento", "REAL")      # descuento escrito en la tabla de nómina
+    _asegurar_columna(con, "roles_cerrados", "dias_base", "REAL")     # días que tuvo el mes al cerrarlo
+    # los días por mes ya no son un parámetro: se usan los días reales de cada mes
+    con.execute("DELETE FROM parametros WHERE clave='dias_base'")
     # el tipo "Recupera gasto" ya no resta del costo: se renombra para que no confunda
     con.execute("UPDATE descuentos SET tipo='Descuento por dotación / compras' "
                 "WHERE tipo='Recupera gasto de la empresa'")
