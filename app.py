@@ -50,6 +50,34 @@ else:
 
 # ---------------------------------------------------------------- acceso
 
+COOKIE = "makal_sesion"
+
+
+def escribir_cookie(valor, dias):
+    """Guarda (o borra, con dias=0) la cookie de sesión en este navegador."""
+    st.html(f"""<script>
+        (function() {{
+          var seg = location.protocol === "https:" ? "; Secure" : "";
+          var c = "{COOKIE}={valor}; Max-Age={dias * 86400}; Path=/; SameSite=Lax" + seg;
+          document.cookie = c;
+          try {{ window.parent.document.cookie = c; }} catch (e) {{}}
+        }})();
+        </script>""", unsafe_allow_javascript=True, width=1)
+
+
+def recuperar_sesion():
+    """Si este dispositivo tiene una sesión recordada y vigente, entra sin pedir contraseña."""
+    if "usuario" in st.session_state or st.session_state.get("salio"):
+        return
+    try:
+        token = st.context.cookies.get(COOKIE)
+    except Exception:  # noqa: BLE001
+        token = None
+    u = db.usuario_de_sesion(con, token)
+    if u:
+        st.session_state.update(usuario=u, rol=db.rol_de(con, u), token_sesion=token)
+
+
 def pantalla_acceso():
     _, centro, _ = st.columns([1, 1.3, 1])
     with centro:
@@ -75,17 +103,30 @@ def pantalla_acceso():
             with st.form("entrar"):
                 usuario = st.text_input("Usuario")
                 clave = st.text_input("Contraseña", type="password")
+                recordar = st.checkbox("Mantener sesión iniciada en este dispositivo", value=True,
+                                       help=f"No vuelve a pedir la contraseña durante {db.DIAS_SESION} días en "
+                                            "este celular o computadora. No lo marques en equipos ajenos.")
                 if st.form_submit_button("Entrar", type="primary", width="stretch", icon=":material/login:"):
                     if db.verificar_usuario(con, usuario, clave):
-                        st.session_state.update(usuario=usuario.strip(), rol=db.rol_de(con, usuario.strip()))
+                        u = usuario.strip()
+                        st.session_state.update(usuario=u, rol=db.rol_de(con, u))
+                        st.session_state.pop("salio", None)
+                        if recordar:
+                            token = db.crear_sesion(con, u)
+                            st.session_state.update(token_sesion=token, cookie_pendiente=token)
                         st.rerun()
                     else:
                         st.error("Usuario o contraseña incorrectos.")
 
 
+recuperar_sesion()
+if st.session_state.pop("borrar_cookie", False):
+    escribir_cookie("", 0)
 if "usuario" not in st.session_state:
     pantalla_acceso()
     st.stop()
+if "cookie_pendiente" in st.session_state:
+    escribir_cookie(st.session_state.pop("cookie_pendiente"), db.DIAS_SESION)
 
 usuario, rol = st.session_state["usuario"], st.session_state.get("rol", "admin")
 
@@ -134,7 +175,9 @@ with st.sidebar:
 
     st.divider()
     if st.button("Cerrar sesión", icon=":material/logout:", width="stretch"):
+        db.borrar_sesion(con, st.session_state.get("token_sesion"))
         st.session_state.clear()
+        st.session_state.update(salio=True, borrar_cookie=True)
         st.rerun()
 
 if "aviso" in st.session_state:
