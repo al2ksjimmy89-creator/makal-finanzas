@@ -426,7 +426,7 @@ def importar_archivo(con, ruta, nombre_cliente, periodo, hoy=None):
             con.execute("""INSERT INTO descuentos (empleado_id, periodo_inicio, tipo, motivo, monto_total, cuotas)
                            VALUES (?,?,?,?,?,1)""", (eid, periodo, tipo, nota or "Importado de Excel", e["descuento"]))
     if cerrado:
-        con.execute("INSERT INTO roles_cerrados VALUES (?,?,?) ON CONFLICT (cliente_id, periodo) DO NOTHING",
+        con.execute("INSERT INTO roles_cerrados (cliente_id, periodo, fecha_cierre) VALUES (?,?,?) ON CONFLICT (cliente_id, periodo) DO NOTHING",
                     (cid, periodo, db.hoy().isoformat()))
     else:
         con.execute("DELETE FROM roles_cerrados WHERE cliente_id=? AND periodo=?", (cid, periodo))
