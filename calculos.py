@@ -1,8 +1,8 @@
 """Cálculos del PyG, rol de pagos y resúmenes.
 
-Regla general: todos los meses se analizan con 30 días.
-- Mes cerrado: día de corte = 30.
-- Mes en curso: día de corte = día de hoy (máximo 30).
+Regla general: cada mes se analiza con sus días reales (octubre 31, noviembre 30, febrero 28/29).
+- Mes cerrado: día de corte = último día del mes.
+- Mes en curso: día de corte = día de hoy.
 Ventas y compras se toman tal como se registraron. Lo que es "por mes"
 (sueldos, bonos, gastos fijos) se calcula proporcional al día de corte.
 """
@@ -22,18 +22,24 @@ def nombre_mes(periodo):
     return f"{MESES[m - 1]} {a}"
 
 
+def dias_mes(periodo):
+    """Días que tiene el mes (28 a 31). Es la base para todo lo proporcional."""
+    a, m = map(int, periodo.split("-"))
+    return monthrange(a, m)[1]
+
+
 def dia_corte(periodo, hoy=None):
     hoy = hoy or db.hoy()
     a, m = map(int, periodo.split("-"))
     if (a, m) < (hoy.year, hoy.month):
-        return 30
+        return dias_mes(periodo)
     if (a, m) == (hoy.year, hoy.month):
-        return min(hoy.day, 30)
+        return hoy.day
     return 0
 
 
 def _indice_dia(fecha_txt, periodo, si_antes, si_despues):
-    """Posición (1..30) de una fecha dentro del mes, en base 30."""
+    """Posición (1..días del mes) de una fecha dentro del mes."""
     if not fecha_txt:
         return None
     f = date.fromisoformat(fecha_txt[:10])
@@ -42,7 +48,7 @@ def _indice_dia(fecha_txt, periodo, si_antes, si_despues):
         return si_antes
     if (f.year, f.month) > (a, m):
         return si_despues
-    return min(f.day, 30)
+    return f.day
 
 
 # ---------------------------------------------------------------- rol de pagos
@@ -53,16 +59,31 @@ def rol_cerrado(con, cliente_id, periodo):
 
 
 def cerrar_rol(con, cliente_id, periodo):
-    """Congela el rol del mes: guarda días, sueldo y bono de cada persona que trabajó."""
-    rol = rol_de_pagos(con, cliente_id, periodo, 30)
+    """Congela el rol del mes: guarda días, sueldo, bono y descuento de cada persona que trabajó,
+    y los días que tuvo el mes (base del cálculo proporcional)."""
+    base = dias_mes(periodo)
+    rol = rol_de_pagos(con, cliente_id, periodo, base)
     for _, f in rol.iterrows():
-        con.execute("""INSERT INTO novedades_rol (empleado_id, periodo, dias, extras, sueldo, bono)
-                       VALUES (?,?,?,?,?,?) ON CONFLICT(empleado_id, periodo) DO UPDATE SET
-                       dias=excluded.dias, sueldo=excluded.sueldo, bono=excluded.bono""",
-                    (int(f["empleado_id"]), periodo, f["Días"], f["Extras"], f["Sueldo"], f["Bono"]))
-    con.execute("""INSERT INTO roles_cerrados VALUES (?,?,?) ON CONFLICT (cliente_id, periodo)
-                   DO UPDATE SET fecha_cierre=excluded.fecha_cierre""", (cliente_id, periodo, db.hoy().isoformat()))
+        con.execute("""INSERT INTO novedades_rol (empleado_id, periodo, dias, extras, sueldo, bono, descuento)
+                       VALUES (?,?,?,?,?,?,?) ON CONFLICT(empleado_id, periodo) DO UPDATE SET
+                       dias=excluded.dias, sueldo=excluded.sueldo, bono=excluded.bono,
+                       descuento=excluded.descuento""",
+                    (int(f["empleado_id"]), periodo, f["Días"], f["Extras"], f["Sueldo"], f["Bono"],
+                     f["Descuentos"]))
+    con.execute("""INSERT INTO roles_cerrados (cliente_id, periodo, fecha_cierre, dias_base) VALUES (?,?,?,?)
+                   ON CONFLICT (cliente_id, periodo) DO UPDATE SET fecha_cierre=excluded.fecha_cierre,
+                   dias_base=excluded.dias_base""", (cliente_id, periodo, db.hoy().isoformat(), base))
     con.commit()
+
+
+def base_dias_rol(con, cliente_id, periodo):
+    """Días con que se prorratea el rol: los del mes; en un mes que se cerró con la regla anterior
+    (sin días guardados) se respetan los 30 de entonces para no cambiar meses pasados."""
+    if rol_cerrado(con, cliente_id, periodo):
+        guardado = db.valor(con, "SELECT dias_base FROM roles_cerrados WHERE cliente_id=? AND periodo=?",
+                            (cliente_id, periodo))
+        return float(guardado) if guardado else 30.0
+    return float(dias_mes(periodo))
 
 
 def reabrir_rol(con, cliente_id, periodo):
@@ -71,8 +92,9 @@ def reabrir_rol(con, cliente_id, periodo):
 
 
 def rol_de_pagos(con, cliente_id, periodo, corte):
-    p = {k: db.parametro(con, k) for k in ("dias_base", "sbu", "iess_patronal", "iess_personal", "fondos_reserva")}
-    base = p["dias_base"] or 30
+    p = {k: db.parametro(con, k) for k in ("sbu", "iess_patronal", "iess_personal", "fondos_reserva")}
+    base = base_dias_rol(con, cliente_id, periodo)
+    dm = dias_mes(periodo)
     emp = db.df(con, "SELECT * FROM empleados WHERE cliente_id=? ORDER BY activo DESC, id", (cliente_id,))
     nov = db.df(con, "SELECT * FROM novedades_rol WHERE periodo=?", (periodo,)).set_index("empleado_id")
     cerrado = rol_cerrado(con, cliente_id, periodo)
@@ -88,8 +110,10 @@ def rol_de_pagos(con, cliente_id, periodo, corte):
         ingreso, salida = db.limpio(e["fecha_ingreso"]), db.limpio(e["fecha_salida"])
         # None = no trabajó este mes (ingresó después o salió antes)
         ini = _indice_dia(ingreso, periodo, 1, None) if ingreso else 1
-        fin = _indice_dia(salida, periodo, None, 30) if salida else 30
+        fin = _indice_dia(salida, periodo, None, dm) if salida else dm
         dias_auto = 0.0 if ini is None or fin is None else max(0.0, min(fin, corte) - ini + 1)
+        if not salida and pd.notna(e["activo"]) and not e["activo"]:
+            dias_auto = 0.0  # inactivo sin fecha de salida: solo cuenta si se le escriben días
 
         n = nov.loc[e["id"]] if e["id"] in nov.index else None
 
@@ -113,6 +137,10 @@ def rol_de_pagos(con, cliente_id, periodo, corte):
                         detalle += f" (cuota {i + 1} de {cuotas})"
                     cuotas_mes.append((detalle, d["monto_total"] / cuotas))
         descuento_total = sum(v for _, v in cuotas_mes)
+        descuento_manual = de_novedad("descuento")  # escrito directo en la tabla de nómina
+        if descuento_manual is not None:
+            cuotas_mes = [("Descuento del mes", descuento_manual)] if descuento_manual else []
+            descuento_total = descuento_manual
 
         if dias <= 0 and extras == 0 and descuento_total == 0:
             continue
@@ -249,7 +277,7 @@ def gastos_por_categoria(con, cliente_id, periodo, corte):
                           AND (hasta IS NULL OR hasta='' OR hasta>=?) GROUP BY categoria_id""",
                  (cliente_id, periodo, periodo))
     reg = reg.merge(fij, on="id", how="left").fillna({"mensual": 0})
-    reg["fijo_prorrateado"] = reg["mensual"] * corte / 30
+    reg["fijo_prorrateado"] = reg["mensual"] * corte / dias_mes(periodo)
     reg["monto"] = reg["registrado"] + reg["fijo_prorrateado"]
     return reg
 
@@ -297,10 +325,10 @@ def pct(valor, total):
 
 
 def proyeccion(r):
-    """Proyección lineal al día 30 a partir del día de corte."""
+    """Proyección lineal al último día del mes a partir del día de corte."""
     if not r["corte"]:
         return None
-    f = 30 / r["corte"]
+    f = dias_mes(r["periodo"]) / r["corte"]
     return {"ventas": r["total_ventas"] * f, "costos": r["costos"] * f,
             "utilidad": r["utilidad_neta"] * f}
 
@@ -377,5 +405,5 @@ def resumen_meses(con, clientes_ids, periodos):
     t = pd.DataFrame(filas)
     if len(t):
         t["Margen"] = t.apply(lambda f: pct(f["Utilidad Neta"], f["Ventas"]), axis=1)
-        t["Mes cerrado"] = t["corte"] >= 30
+        t["Mes cerrado"] = [c >= dias_mes(p) for c, p in zip(t["corte"], t["Periodo"])]
     return t
