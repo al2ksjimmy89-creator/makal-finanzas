@@ -213,6 +213,12 @@ CREATE TABLE IF NOT EXISTS roles_cerrados (
     dias_base REAL,                    -- días que tuvo el mes (base del proporcional)
     PRIMARY KEY (cliente_id, periodo)
 );
+-- Sesiones recordadas ("mantener sesión iniciada"): solo se guarda el hash del código, nunca la contraseña
+CREATE TABLE IF NOT EXISTS sesiones (
+    token_hash TEXT PRIMARY KEY,
+    usuario TEXT NOT NULL,
+    expira TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS descuentos (
     id INTEGER PRIMARY KEY,
     empleado_id INTEGER NOT NULL REFERENCES empleados(id),
@@ -466,13 +472,15 @@ def df(con, sql, params=()):
 
 TABLAS = ["usuarios", "parametros", "clientes", "servicios_cliente", "personas_mensuales", "categorias",
           "proveedores", "empleados", "raciones", "ventas_mensuales", "ventas_extra", "gastos", "gastos_fijos",
-          "presupuesto", "novedades_rol", "roles_cerrados", "descuentos"]  # en orden: primero las referenciadas
+          "presupuesto", "novedades_rol", "roles_cerrados", "descuentos", "sesiones"]  # primero las referenciadas
 
 
 def exportar_todo(con):
     """Todas las tablas (sin contraseñas) para descargar como respaldo en Excel."""
     hojas = {}
     for t in TABLAS:
+        if t == "sesiones":
+            continue
         d = df(con, f"SELECT * FROM {t}")
         hojas[t] = d.drop(columns=["clave_hash"], errors="ignore")
     return hojas
@@ -553,6 +561,41 @@ def cambiar_clave(con, usuario, clave):
     h = bcrypt.hashpw(clave.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
     con.execute("UPDATE usuarios SET clave_hash=? WHERE usuario=?", (h, usuario))
     con.commit()
+
+
+DIAS_SESION = 30
+
+
+def _hash_token(token):
+    import hashlib
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def crear_sesion(con, usuario):
+    """Código aleatorio para recordar la sesión en un dispositivo. Devuelve el código (va a la cookie)."""
+    import secrets
+    from datetime import timedelta
+    token = secrets.token_urlsafe(32)
+    con.execute("DELETE FROM sesiones WHERE expira < ?", (hoy().isoformat(),))
+    con.execute("INSERT INTO sesiones (token_hash, usuario, expira) VALUES (?,?,?)",
+                (_hash_token(token), usuario, (hoy() + timedelta(days=DIAS_SESION)).isoformat()))
+    con.commit()
+    return token
+
+
+def usuario_de_sesion(con, token):
+    """Usuario dueño de un código de sesión vigente, o None."""
+    if not token:
+        return None
+    fila = con.execute("""SELECT s.usuario FROM sesiones s JOIN usuarios u ON u.usuario = s.usuario
+                          WHERE s.token_hash=? AND s.expira >= ?""", (_hash_token(token), hoy().isoformat())).fetchone()
+    return fila[0] if fila else None
+
+
+def borrar_sesion(con, token):
+    if token:
+        con.execute("DELETE FROM sesiones WHERE token_hash=?", (_hash_token(token),))
+        con.commit()
 
 
 def verificar_usuario(con, usuario, clave):
