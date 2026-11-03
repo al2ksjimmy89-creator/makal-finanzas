@@ -65,7 +65,7 @@ def pdf_rol(f, periodo, cliente):
     cedula = db.limpio(f.get("Cédula")) or "-"
     pdf.cell(0, 6, f"Cédula: {cedula}    Cargo: {f['Cargo'] or '-'}", new_x="LMARGIN", new_y="NEXT")
     pdf.cell(0, 6, f"Contrato: {f['Contrato']}", new_x="LMARGIN", new_y="NEXT")
-    pdf.cell(0, 6, f"Días trabajados: {f['Días']:g} de 30    Sueldo mensual: {_dinero(f['Sueldo'])}",
+    pdf.cell(0, 6, f"Días trabajados: {f['Días']:g} de {calc.dias_mes(periodo)}    Sueldo mensual: {_dinero(f['Sueldo'])}",
              new_x="LMARGIN", new_y="NEXT")
 
     _titulo_seccion(pdf, "INGRESOS")
