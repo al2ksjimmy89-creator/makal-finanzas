@@ -190,7 +190,7 @@ def clientes(con):
 
     st.markdown("**Personas con pago mensual fijo** (ej. Instructores)")
     pers = db.df(con, "SELECT id, grupo, nombre, grado, valor_mensual, activo FROM personas_mensuales "
-                      "WHERE cliente_id=? ORDER BY grupo, id", (cid,))
+                      "WHERE cliente_id=? ORDER BY grupo, activo DESC, id", (cid,))
     pers["activo"] = pers["activo"].fillna(1).astype(bool)
     clave = f"pers_{cid}"
     ed = st.data_editor(pers, hide_index=True, width="stretch", num_rows="dynamic",
@@ -200,8 +200,14 @@ def clientes(con):
                             "valor_mensual": st.column_config.NumberColumn("Valor fijo mensual", format="$%.2f"),
                             "activo": st.column_config.CheckboxColumn("Activo", default=True)})
     if st.button("💾 Guardar personas", key=f"g_{clave}"):
+        # quien ya tuvo pagos no se borra (se perdería su historial): queda inactivo, al final del cuadro
+        quitados = set(pers["id"]) - set(ed["id"].dropna().astype(int))
+        con_historial = {i for i in quitados
+                         if db.valor(con, "SELECT COUNT(*) FROM ventas_mensuales WHERE persona_id=?", (int(i),), 0)}
+        for i in con_historial:
+            con.execute("UPDATE personas_mensuales SET activo=0 WHERE id=?", (int(i),))
         db.guardar_editor(con, "personas_mensuales", ed.assign(activo=ed["activo"].fillna(True).astype(int)),
-                          pers["id"].tolist(), ["grupo", "nombre", "grado", "valor_mensual", "activo"],
+                          [i for i in pers["id"].tolist() if i not in con_historial], ["grupo", "nombre", "grado", "valor_mensual", "activo"],
                           {"cliente_id": cid}, lambda d: d["nombre"])
         _guardado(clave)
 
