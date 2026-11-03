@@ -421,14 +421,23 @@ def editor_gastos(con, cid, periodo, secciones, clave, proveedores_secciones=Non
     # proveedores del cuadro + los antiguos que aparezcan en compras ya registradas
     todos = db.df(con, "SELECT id, nombre, categoria_id FROM proveedores")
     nombres_prov = list(provs["nombre"]) + sorted(set(datos["proveedor"].dropna()) - set(provs["nombre"]))
+    TODOS_PROV = "Todos los proveedores"
+    filtro = st.selectbox("Filtrar por proveedor", [TODOS_PROV, *sorted(nombres_prov, key=str.lower)],
+                          key=f"filtro_{clave}", help="Muestra solo las compras de ese proveedor y su histórico.")
+    completo = datos
+    if filtro != TODOS_PROV:
+        datos = datos[datos["proveedor"] == filtro].reset_index(drop=True)
+        st.caption(md(f"Compras de **{filtro}** este mes: {len(datos)} · {dinero(datos['monto'].fillna(0).sum())}"))
     editado = st.data_editor(
-        datos, hide_index=True, width="stretch", num_rows="dynamic", height=420,
-        key=f"{clave}_{_version(clave)}",
+        datos, hide_index=True, width="stretch", num_rows="dynamic", placeholder="",
+        height=420 if filtro == TODOS_PROV else min(38 * (len(datos) + 2), 420),
+        key=f"{clave}_{filtro}_{_version(clave)}",
         column_config={
             "id": None,
             "fecha": st.column_config.DateColumn("Fecha", default=_fecha_defecto(periodo), format="DD/MM/YYYY"),
             "categoria": st.column_config.SelectboxColumn("Bodega", options=list(cats["nombre"])),
-            "proveedor": st.column_config.SelectboxColumn("Proveedor", options=nombres_prov),
+            "proveedor": st.column_config.SelectboxColumn("Proveedor", options=nombres_prov,
+                                                          default=None if filtro == TODOS_PROV else filtro),
             "detalle": st.column_config.TextColumn("Detalle"),
             "cantidad": st.column_config.NumberColumn("Cant.", min_value=0.0),
             "precio_unit": st.column_config.NumberColumn("P. unit.", format="$%.3f", min_value=0.0),
@@ -459,7 +468,52 @@ def editor_gastos(con, cid, periodo, secciones, clave, proveedores_secciones=Non
                            "n_factura", "pagado"],
                           {"cliente_id": cid, "periodo": periodo}, lambda d: d["monto"] and d["categoria_id"])
         _guardado(clave)
-    return datos
+    if filtro != TODOS_PROV:
+        historico_proveedor(con, cid, filtro, secciones, periodo)
+    return completo
+
+
+def historico_proveedor(con, cid, proveedor, secciones, periodo):
+    """Todo lo registrado a un proveedor (todos los meses): totales a la fecha, por mes y detalle."""
+    h = db.df(con, f"""SELECT g.periodo, g.fecha, c.nombre AS bodega, g.detalle, g.cantidad, g.precio_unit, g.monto,
+                              g.n_factura, g.pagado
+                       FROM gastos g JOIN categorias c ON c.id=g.categoria_id
+                       JOIN proveedores p ON p.id=g.proveedor_id
+                       WHERE g.cliente_id=? AND p.nombre=? AND c.seccion IN ({','.join('?' * len(secciones))})
+                       ORDER BY g.fecha DESC, g.id DESC""", (cid, proveedor, *secciones))
+    with st.container(border=True, key=f"caja_hist_{secciones[0]}"):
+        st.markdown(f"**Histórico de {proveedor}** · todos los meses registrados")
+        if h.empty:
+            st.info("Este proveedor aún no tiene compras registradas.", icon=":material/info:")
+            return
+        h["monto"] = h["monto"].fillna(0)
+        h["pagado"] = h["pagado"].fillna(0).astype(bool)
+        total, pendiente = h["monto"].sum(), h.loc[~h["pagado"], "monto"].sum()
+        meses = h.groupby("periodo")["monto"].sum().sort_index()
+        c = st.columns(4)
+        tarjeta(c[0], "Total registrado a la fecha", dinero(total), f"{len(h)} compras", "cian")
+        tarjeta(c[1], "Este mes", dinero(meses.get(periodo, 0.0)), calc.nombre_mes(periodo), "blanco")
+        tarjeta(c[2], "Promedio por mes", dinero(meses.mean()), f"{len(meses)} meses con compras", "blanco")
+        tarjeta(c[3], "Pendiente de pago", dinero(pendiente), "facturas sin pagar", "rosa" if pendiente else "negro")
+        st.write("")
+        fig = go.Figure(go.Bar(x=[calc.nombre_mes(p) for p in meses.index], y=meses.values, marker_color=CIAN,
+                               text=[dinero(v, 0) for v in meses.values], textposition="outside"))
+        st.plotly_chart(estilo_figura(fig.update_layout(title=f"Compras a {proveedor} por mes"), 280, False),
+                        width="stretch")
+        h["mes"] = [calc.nombre_mes(p) for p in h["periodo"]]
+        h["fecha"] = _a_fecha(h["fecha"])
+        st.dataframe(h[["fecha", "mes", "bodega", "detalle", "cantidad", "precio_unit", "monto", "n_factura",
+                        "pagado"]], hide_index=True, width="stretch", height=min(38 * (len(h) + 1), 420),
+                     column_config={
+                         "fecha": st.column_config.DateColumn("Fecha", format="DD/MM/YYYY", pinned=True),
+                         "mes": "Mes", "bodega": "Bodega", "detalle": "Detalle",
+                         "cantidad": st.column_config.NumberColumn("Cant."),
+                         "precio_unit": st.column_config.NumberColumn("P. unit.", format="$%.3f"),
+                         "monto": st.column_config.NumberColumn("Valor", format="$%.2f"),
+                         "n_factura": "N° factura", "pagado": st.column_config.CheckboxColumn("Pagado")})
+        hoja = "".join(ch for ch in proveedor if ch not in '[]:*?/\\')[:31] or "Historico"
+        descargar_excel({hoja: h.drop(columns=["periodo"])},
+                        f"Historico_{proveedor}.xlsx".replace(" ", "_"), "Descargar histórico en Excel")
 
 
 ICONOS_BODEGA = {"Vegetales": ":material/eco:", "Abastos": ":material/inventory_2:",
