@@ -66,16 +66,41 @@ def escribir_cookie(valor, dias):
 
 
 def recuperar_sesion():
-    """Si este dispositivo tiene una sesión recordada y vigente, entra sin pedir contraseña."""
+    """Si este dispositivo tiene una sesión recordada y vigente, entra sin pedir contraseña.
+    El código llega por la cookie (en la computadora) o, en la nube, el navegador lo pasa una sola vez
+    en la dirección (?s=...) porque el servidor de Streamlit no entrega las cookies a la app."""
+    desde_url = st.query_params.get("s")
+    if desde_url:
+        st.query_params.clear()  # no dejar el código a la vista en la dirección
     if "usuario" in st.session_state or st.session_state.get("salio"):
         return
-    try:
-        token = st.context.cookies.get(COOKIE)
-    except Exception:  # noqa: BLE001
-        token = None
+    token = desde_url
+    if not token:
+        try:
+            token = st.context.cookies.get(COOKIE)
+        except Exception:  # noqa: BLE001
+            token = None
     u = db.usuario_de_sesion(con, token)
     if u:
         st.session_state.update(usuario=u, rol=db.rol_de(con, u), token_sesion=token)
+    elif desde_url:
+        st.session_state["borrar_cookie"] = True  # código vencido o inválido: se olvida
+    else:
+        st.session_state["intentar_cookie"] = True
+
+
+def enviar_cookie_al_servidor():
+    """En la pantalla de acceso: si el navegador tiene una sesión recordada, recarga una vez con ?s=código."""
+    st.html(f"""<script>
+        (function() {{
+          var m = document.cookie.match(/(?:^|; ){COOKIE}=([^;]+)/);
+          if (!m) return;
+          var w = window.top || window;
+          try {{ if (w.location.search.indexOf("s=") >= 0) return;
+                 w.location.replace(w.location.pathname + "?s=" + encodeURIComponent(m[1])); }}
+          catch (e) {{ location.replace(location.pathname + "?s=" + encodeURIComponent(m[1])); }}
+        }})();
+        </script>""", unsafe_allow_javascript=True, width=1)
 
 
 def pantalla_acceso():
@@ -120,8 +145,11 @@ def pantalla_acceso():
 
 
 recuperar_sesion()
+intentar = st.session_state.pop("intentar_cookie", False)
 if st.session_state.pop("borrar_cookie", False):
     escribir_cookie("", 0)
+elif intentar and "usuario" not in st.session_state:
+    enviar_cookie_al_servidor()
 if "usuario" not in st.session_state:
     pantalla_acceso()
     st.stop()
