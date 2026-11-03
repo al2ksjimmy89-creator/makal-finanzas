@@ -1,6 +1,6 @@
 """Pantalla de un mes: Dashboard, PyG, Ventas, Materia Prima, Mano de Obra, Otros gastos y Por pagar."""
 from calendar import monthrange
-from datetime import date
+from datetime import date, timedelta
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -44,21 +44,22 @@ def mostrar(con, cliente, periodo, solo_lectura=False):
 
     corte = st.session_state.get(f"corte_{periodo}", corte_auto) if corte_auto else 0
     r = calc.pyg(con, cid, periodo, corte)
-    banner(calc.nombre_mes(periodo), f"{cliente['nombre']} · análisis al día {corte} de 30",
+    dm = calc.dias_mes(periodo)
+    banner(calc.nombre_mes(periodo), f"{cliente['nombre']} · análisis al día {corte} de {dm}",
            "Utilidad del mes", dinero(r["utilidad_neta"]))
 
     c1, c2 = st.columns([3, 1], vertical_alignment="bottom")
     ult = calc.ultimo_dia_con_ventas(con, cid, periodo)
     if corte_auto == 0:
         c1.info("Mes futuro: aún no hay datos para analizar.", icon=":material/event:")
-    elif corte_auto < 30 and ult and min(ult.day, 30) < corte - 1:
+    elif corte_auto < dm and ult and ult.day < corte - 1:
         c1.warning(f"Las raciones están registradas hasta el **{ult:%d/%m}**, pero el análisis va al día "
                    f"**{corte}**. Sueldos y gastos fijos ya cuentan hasta el día {corte}: registra las ventas "
                    f"que faltan para ver la utilidad real.", icon=":material/warning:")
     if corte_auto:
-        c2.number_input("Analizar hasta el día", 1, 30, corte_auto, key=f"corte_{periodo}",
-                        help="Mes cerrado = 30. Mes en curso = hoy. Todo lo mensual se calcula "
-                             "proporcional a este día.")
+        c2.number_input("Analizar hasta el día", 1, dm, corte_auto, key=f"corte_{periodo}",
+                        help=f"Mes cerrado = {dm} (días del mes). Mes en curso = hoy. Todo lo mensual se "
+                             "calcula proporcional a este día.")
 
     pestanas = st.container(key="pestanas")
     if solo_lectura:
@@ -98,7 +99,7 @@ def dashboard(con, cliente, periodo, r):
 
     costos = r["costos"] + r["total_fin"]
     c = st.columns(4)
-    tarjeta(c[0], "Ventas", dinero(tv), f"al día {r['corte']} de 30", "cian")
+    tarjeta(c[0], "Ventas", dinero(tv), f"al día {r['corte']} de {calc.dias_mes(periodo)}", "cian")
     tarjeta(c[1], "Costos", dinero(costos), porcentaje(calc.pct(costos, tv)) + " de las ventas", "rosa")
     tarjeta(c[2], "Utilidad", dinero(r["utilidad_neta"]), f"meta {dinero(tv * meta, 0)}", "negro")
     tarjeta(c[3], "Margen", porcentaje(margen), f"meta {porcentaje(meta)} " + ("✔" if margen >= meta else "✖"),
@@ -112,8 +113,8 @@ def dashboard(con, cliente, periodo, r):
     tarjeta(c[2], "Costos indirectos", dinero(r["indirectos"]),
             porcentaje(calc.pct(r["indirectos"], tv)) + " de ventas", "blanco")
     proy = calc.proyeccion(r)
-    if proy and r["corte"] < 30:
-        tarjeta(c[3], "Proyección al día 30", dinero(proy["utilidad"]),
+    if proy and r["corte"] < calc.dias_mes(periodo):
+        tarjeta(c[3], f"Proyección al día {calc.dias_mes(periodo)}", dinero(proy["utilidad"]),
                 f"ventas {dinero(proy['ventas'], 0)} si sigue igual", "blanco", proy["utilidad"])
     else:
         tarjeta(c[3], "Financiamiento", dinero(r["total_fin"]), "abonos / cuotas del mes", "blanco")
@@ -185,7 +186,7 @@ def pestaña_pyg(con, cliente, periodo, r):
     if cliente["meta_utilidad"]:
         pres["UTILIDAD FINAL NETA"] = cliente["meta_utilidad"]
     st.html(tabla_pyg_html(t, pres))
-    st.caption(f"Análisis al día {r['corte']} de 30. Sueldos y gastos fijos proporcionales al día de corte. "
+    st.caption(f"Análisis al día {r['corte']} de {calc.dias_mes(periodo)}. Sueldos y gastos fijos proporcionales al día de corte. "
                "La columna Presupuesto es el % sobre ventas asignado al cliente.")
     exportar = t[t["Monto"].notna()][["Concepto", "Monto", "% Ventas"]]
     descargar_excel({"PyG": exportar, "Rol de pagos": r["rol"].drop(columns=["empleado_id", "detalle_descuentos"],
@@ -211,10 +212,10 @@ def pestaña_ventas(con, cid, periodo):
         with st.expander(f"Raciones diarias · {grupo}", expanded=True):
             editor_raciones(con, cid, periodo, grupo, serv)
 
-    personas = db.df(con, "SELECT * FROM personas_mensuales WHERE cliente_id=? AND activo=1 ORDER BY grupo, id",
+    personas = db.df(con, "SELECT * FROM personas_mensuales WHERE cliente_id=? ORDER BY grupo, activo DESC, id",
                      (cid,))
     for grupo, pers in personas.groupby("grupo", sort=False):
-        with st.expander(f"Pago mensual fijo · {grupo} (se registra a fin de mes)"):
+        with st.expander(f"Pago mensual fijo · {grupo} (editar nombres, grados y valores)"):
             editor_mensuales(con, cid, periodo, pers)
 
     with st.expander("Ventas adicionales · personal externo, eventos extras", expanded=True):
@@ -261,34 +262,74 @@ def editor_raciones(con, cid, periodo, grupo, serv):
 
 
 def editor_mensuales(con, cid, periodo, pers):
+    """Personas con pago mensual fijo (ej. Instructores): se editan nombre, grado y valor aquí mismo,
+    se agregan o eliminan filas. Los inactivos quedan al final del cuadro."""
+    grupo = pers["grupo"].iloc[0]
+    pers = pers.assign(activo=pers["activo"].fillna(1).astype(int)).sort_values(["activo", "id"],
+                                                                               ascending=[False, True])
     actuales = db.df(con, "SELECT persona_id, monto FROM ventas_mensuales WHERE periodo=? AND cliente_id=?",
                      (periodo, cid)).set_index("persona_id")["monto"].to_dict()
-    clave = f"men_{cid}_{periodo}_{pers['grupo'].iloc[0]}"
-    if st.button("Llenar con el valor fijo de cada persona", key=f"llenar_{clave}"):
+    clave = f"men_{cid}_{periodo}_{grupo}"
+    if st.button("Llenar con el valor fijo de cada persona activa", key=f"llenar_{clave}"):
         st.session_state[f"lleno_{clave}"] = True
         st.session_state[f"v_{clave}"] = _version(clave) + 1
     lleno = st.session_state.get(f"lleno_{clave}", False)
     tabla = pd.DataFrame({
-        "persona_id": pers["id"], "Nombre": pers["nombre"], "Grado": pers["grado"],
-        "Valor fijo": pers["valor_mensual"],
-        "Monto del mes": [actuales.get(i, v if lleno else 0.0) for i, v in zip(pers["id"], pers["valor_mensual"])],
-    })
-    editado = st.data_editor(tabla, hide_index=True, width="stretch", key=f"{clave}_{_version(clave)}",
-                             column_config={"persona_id": None, "Nombre": st.column_config.TextColumn(disabled=True),
-                                            "Grado": st.column_config.TextColumn(disabled=True),
-                                            "Valor fijo": st.column_config.NumberColumn(format="$%.2f", disabled=True),
-                                            "Monto del mes": DINERO})
-    st.write(md(f"**Total del mes:** {dinero(editado['Monto del mes'].sum())}"))
-    if st.button("💾 Guardar pagos mensuales", key=f"g_{clave}"):
-        for _, f in editado.iterrows():
-            if f["Monto del mes"]:
-                con.execute("""INSERT INTO ventas_mensuales (cliente_id, periodo, persona_id, monto) VALUES (?,?,?,?)
-                               ON CONFLICT(periodo, persona_id) DO UPDATE SET monto=excluded.monto""",
-                            (cid, periodo, int(f["persona_id"]), float(f["Monto del mes"])))
-            else:
-                con.execute("DELETE FROM ventas_mensuales WHERE periodo=? AND persona_id=?",
-                            (periodo, int(f["persona_id"])))
-        con.commit()
+        "persona_id": pers["id"].astype("Int64"), "Nombre": pers["nombre"], "Grado": pers["grado"],
+        "Valor fijo": pers["valor_mensual"].astype(float),
+        "Monto del mes": [actuales.get(i, v if lleno and a else 0.0)
+                          for i, v, a in zip(pers["id"], pers["valor_mensual"], pers["activo"])],
+        "Activo": pers["activo"].astype(bool),
+    }).reset_index(drop=True)
+    editado = st.data_editor(
+        tabla, hide_index=True, width="stretch", num_rows="dynamic", key=f"{clave}_{_version(clave)}",
+        column_config={"persona_id": None,
+                       "Nombre": st.column_config.TextColumn(required=True, pinned=True),
+                       "Grado": st.column_config.TextColumn("Grado / rango"),
+                       "Valor fijo": st.column_config.NumberColumn(format="$%.2f", min_value=0.0, default=40.0),
+                       "Monto del mes": DINERO,
+                       "Activo": st.column_config.CheckboxColumn(default=True)})
+    st.write(md(f"**Total del mes:** {dinero(editado['Monto del mes'].fillna(0).sum())}"))
+    st.caption("Edita nombre, grado o valor directo en la tabla. Para agregar usa la fila vacía del final; para "
+               "eliminar selecciona la fila y el basurero (si ya tuvo pagos en otros meses queda inactivo para no "
+               "borrar su historial). Los inactivos se ordenan al final.")
+    if st.button("💾 Guardar " + grupo.lower(), key=f"g_{clave}"):
+        try:
+            ids_despues = set()
+            for _, f in editado.iterrows():
+                nombre = db.limpio(f["Nombre"])
+                if not nombre:
+                    continue
+                datos = (str(nombre).strip(), db.limpio(f["Grado"]), float(db.limpio(f["Valor fijo"]) or 0),
+                         int(bool(db.limpio(f["Activo"]) if db.limpio(f["Activo"]) is not None else True)))
+                pid = db.limpio(f["persona_id"])
+                if pid is None:
+                    pid = con.execute("""INSERT INTO personas_mensuales (cliente_id, grupo, nombre, grado,
+                                         valor_mensual, activo) VALUES (?,?,?,?,?,?) RETURNING id""",
+                                      (cid, grupo, *datos)).fetchone()[0]
+                else:
+                    pid = int(pid)
+                    con.execute("UPDATE personas_mensuales SET nombre=?, grado=?, valor_mensual=?, activo=? "
+                                "WHERE id=?", (*datos, pid))
+                ids_despues.add(pid)
+                monto = float(db.limpio(f["Monto del mes"]) or 0)
+                if monto:
+                    con.execute("""INSERT INTO ventas_mensuales (cliente_id, periodo, persona_id, monto)
+                                   VALUES (?,?,?,?) ON CONFLICT(periodo, persona_id) DO UPDATE SET
+                                   monto=excluded.monto""", (cid, periodo, pid, monto))
+                else:
+                    con.execute("DELETE FROM ventas_mensuales WHERE periodo=? AND persona_id=?", (periodo, pid))
+            for pid in set(int(i) for i in pers["id"]) - ids_despues:
+                con.execute("DELETE FROM ventas_mensuales WHERE periodo=? AND persona_id=?", (periodo, pid))
+                if db.valor(con, "SELECT COUNT(*) FROM ventas_mensuales WHERE persona_id=?", (pid,), 0):
+                    con.execute("UPDATE personas_mensuales SET activo=0 WHERE id=?", (pid,))
+                else:
+                    con.execute("DELETE FROM personas_mensuales WHERE id=?", (pid,))
+            con.commit()
+        except Exception as error:  # noqa: BLE001
+            con.rollback()
+            st.error(f"No se guardó: {error}. Revisa que no haya dos personas con el mismo nombre.")
+            return
         st.session_state.pop(f"lleno_{clave}", None)
         _guardado(clave)
 
@@ -550,24 +591,202 @@ def pestaña_otros_gastos(con, cid, periodo, r):
 
 # ================================================================ mano de obra
 
-def tabla_rol(rol):
-    """Rol del mes: oculta las columnas que están en cero para todos (ej. aportes, si todos son por
-    prestación de servicios) y resalta en negrita lo que se le paga a cada uno."""
-    vista = rol.drop(columns=["empleado_id", "detalle_descuentos", "Cédula"], errors="ignore")
-    texto = ["Nombre", "Cargo", "Contrato"]
-    siempre = ["Sueldo", "Días", "Sueldo proporcional", "Costo empresa", "Neto a pagar"]
-    vista = vista[[c for c in vista.columns if c in texto or c in siempre or vista[c].abs().sum() > 0.004]]
-    dinero_cols = [c for c in vista.columns if c not in texto and c != "Días"]
-    formatos = {c: dinero for c in dinero_cols}
-    formatos["Días"] = "{:g}"
-    estilo = (vista.style
-              .format(formatos)
-              .set_properties(subset=["Neto a pagar"], **{"font-weight": "800", "color": NEGRO,
-                                                          "background-color": "#E8F8FD"})
-              .set_properties(subset=["Nombre"], **{"font-weight": "600"}))
-    st.dataframe(estilo, hide_index=True, width="stretch", alt="Rol de pagos del mes")
-    st.caption("Costo empresa = lo que va al PyG. Neto a pagar = lo que recibe cada persona (después de "
-               "descuentos y adelantos).")
+# Columnas de la tabla de nómina -> campo en la base.
+# Datos de la persona (valen para todos los meses):
+CAMPOS_EMPLEADO = {"Nombre": "nombre", "Cargo": "cargo", "Cédula": "cedula", "Sueldo": "sueldo",
+                   "Bono mov. mensual": "bono", "Ingreso": "fecha_ingreso", "Salida": "fecha_salida",
+                   "Contrato": "tipo_contrato", "Activo": "activo"}
+# Novedades de este mes:
+CAMPOS_MES = {"Días Lab.": "dias", "Otros pagos": "extras", "Descuento": "descuento",
+              "Observación": "observacion"}
+COLS_CALCULADAS = ["Total gasto (PyG)", "Valor a recibir"]
+
+
+def tabla_nomina(con, cid, periodo, rol):
+    """Una fila por colaborador del mes: activos primero y los inactivos al final."""
+    emp = db.df(con, "SELECT * FROM empleados WHERE cliente_id=? ORDER BY activo DESC, id", (cid,))
+    calc_por_id = rol.set_index("empleado_id") if len(rol) else pd.DataFrame()
+    nov = db.df(con, "SELECT empleado_id, observacion FROM novedades_rol WHERE periodo=?",
+                (periodo,)).set_index("empleado_id")["observacion"].to_dict()
+    # se muestran: los que tienen valores este mes + (si el rol está abierto) los activos que ya habían
+    # ingresado, aunque todavía no sumen días
+    fin_mes = f"{periodo}-{calc.dias_mes(periodo):02d}"
+    vigentes = (emp["activo"].fillna(1) == 1) & (emp["fecha_ingreso"].fillna("").str[:10] <= fin_mes)
+    if calc.rol_cerrado(con, cid, periodo):
+        vigentes = vigentes & False
+    emp = emp[emp["id"].isin(calc_por_id.index) | vigentes]
+    filas = []
+    for _, e in emp.iterrows():
+        c = calc_por_id.loc[e["id"]] if e["id"] in calc_por_id.index else None
+        filas.append({
+            "empleado_id": int(e["id"]), "Nombre": e["nombre"], "Cargo": e["cargo"], "Cédula": e["cedula"],
+            "Sueldo": float(c["Sueldo"]) if c is not None else float(e["sueldo"] or 0),
+            "Días Lab.": float(c["Días"]) if c is not None else 0.0,
+            "Bono mov. mensual": float(e["bono"] or 0),
+            "Otros pagos": float(c["Extras"]) if c is not None else 0.0,
+            "Ingreso": e["fecha_ingreso"], "Salida": e["fecha_salida"],
+            "Descuento": float(c["Descuentos"]) if c is not None else 0.0,
+            "Total gasto (PyG)": float(c["Costo empresa"]) if c is not None else 0.0,
+            "Valor a recibir": float(c["Neto a pagar"]) if c is not None else 0.0,
+            "Contrato": e["tipo_contrato"] or db.TIPOS_CONTRATO[0],
+            "Activo": bool(e["activo"] if pd.notna(e["activo"]) else 1),
+            "Observación": nov.get(e["id"]),
+        })
+    t = pd.DataFrame(filas, columns=["empleado_id", *CAMPOS_EMPLEADO, *CAMPOS_MES, *COLS_CALCULADAS])
+    t = t.sort_values("Activo", ascending=False, kind="stable").reset_index(drop=True)
+    for c in ("Ingreso", "Salida"):
+        t[c] = _a_fecha(t[c])
+    for c in ("Nombre", "Cargo", "Cédula", "Observación"):
+        t[c] = t[c].astype("string")
+    t.insert(1, "Nº", range(1, len(t) + 1))
+    return t
+
+
+def _valor_campo(campo, v):
+    v = db.limpio(v)
+    if campo in ("fecha_ingreso", "fecha_salida"):
+        return db.a_texto_fecha(v)
+    if campo == "activo":
+        return 1 if v is None else int(bool(v))
+    if campo in ("sueldo", "bono"):
+        return float(v or 0)
+    if campo == "extras":
+        return float(v or 0)
+    return v
+
+
+def _guardar_novedad(con, eid, periodo, campos):
+    """Escribe solo los campos del mes que cambiaron; si la fila queda vacía se borra."""
+    if not campos:
+        return
+    cols = list(campos)
+    con.execute(f"""INSERT INTO novedades_rol (empleado_id, periodo, {', '.join(cols)})
+                    VALUES (?,?,{','.join('?' * len(cols))}) ON CONFLICT(empleado_id, periodo) DO UPDATE SET
+                    {', '.join(f'{c}=excluded.{c}' for c in cols)}""", (eid, periodo, *campos.values()))
+    con.execute("""DELETE FROM novedades_rol WHERE empleado_id=? AND periodo=? AND dias IS NULL
+                   AND COALESCE(extras,0)=0 AND descuento IS NULL AND observacion IS NULL
+                   AND sueldo IS NULL AND bono IS NULL""", (eid, periodo))
+
+
+def _quitar_empleado(con, cid, eid, periodo):
+    """Eliminar de la nómina. Si nunca tuvo historial se borra; si ya aparece en otros meses
+    o tiene descuentos, se desactiva y deja de contar desde este mes (los meses pasados no cambian)."""
+    otros = db.valor(con, "SELECT COUNT(*) FROM novedades_rol WHERE empleado_id=? AND periodo<>?",
+                     (eid, periodo), 0)
+    desc = db.valor(con, "SELECT COUNT(*) FROM descuentos WHERE empleado_id=?", (eid,), 0)
+    a, m = map(int, periodo.split("-"))
+    ingreso = db.valor(con, "SELECT fecha_ingreso FROM empleados WHERE id=?", (eid,))
+    trabajo_antes = bool(ingreso) and ingreso[:7] < periodo
+    con.execute("DELETE FROM novedades_rol WHERE empleado_id=? AND periodo=?", (eid, periodo))
+    if not otros and not desc and not trabajo_antes:
+        con.execute("DELETE FROM empleados WHERE id=? AND cliente_id=?", (eid, cid))
+    else:
+        fin_mes_anterior = (date(a, m, 1) - timedelta(days=1)).isoformat()
+        con.execute("""UPDATE empleados SET activo=0,
+                       fecha_salida=CASE WHEN fecha_salida IS NULL OR fecha_salida>=? THEN ? ELSE fecha_salida END
+                       WHERE id=?""", (date(a, m, 1).isoformat(), fin_mes_anterior, eid))
+
+
+def _guardar_cambios_nomina(con, cid, periodo, tabla, clave_widget, clave):
+    """Se ejecuta apenas se edita una celda: guarda y la tabla se recalcula (como en Excel)."""
+    cambios = st.session_state.get(clave_widget) or {}
+    editadas, nuevas, borradas = (cambios.get("edited_rows", {}), cambios.get("added_rows", []),
+                                  cambios.get("deleted_rows", []))
+    if any(not db.limpio(f.get("Nombre")) for f in nuevas):
+        return  # fila nueva sin nombre todavía: se espera a que la completen
+    a, m = map(int, periodo.split("-"))
+    try:
+        for pos, campos in editadas.items():
+            eid = int(tabla.iloc[int(pos)]["empleado_id"])
+            emp = {CAMPOS_EMPLEADO[c]: _valor_campo(CAMPOS_EMPLEADO[c], v) for c, v in campos.items()
+                   if c in CAMPOS_EMPLEADO}
+            if "nombre" in emp and not emp["nombre"]:
+                emp.pop("nombre")
+            if emp:
+                con.execute(f"UPDATE empleados SET {', '.join(f'{k}=?' for k in emp)} WHERE id=?",
+                            (*emp.values(), eid))
+            _guardar_novedad(con, eid, periodo, {CAMPOS_MES[c]: _valor_campo(CAMPOS_MES[c], v)
+                                                 for c, v in campos.items() if c in CAMPOS_MES})
+        for f in nuevas:
+            emp = {campo: _valor_campo(campo, f.get(col)) for col, campo in CAMPOS_EMPLEADO.items()}
+            emp["fecha_ingreso"] = emp["fecha_ingreso"] or date(a, m, 1).isoformat()
+            emp["tipo_contrato"] = emp["tipo_contrato"] or db.TIPOS_CONTRATO[0]
+            eid = con.execute(f"""INSERT INTO empleados (cliente_id, {', '.join(emp)})
+                                  VALUES (?,{','.join('?' * len(emp))}) RETURNING id""",
+                              (cid, *emp.values())).fetchone()[0]
+            _guardar_novedad(con, eid, periodo, {CAMPOS_MES[c]: _valor_campo(CAMPOS_MES[c], v)
+                                                 for c, v in f.items() if c in CAMPOS_MES and db.limpio(v)})
+        for pos in borradas:
+            _quitar_empleado(con, cid, int(tabla.iloc[int(pos)]["empleado_id"]), periodo)
+        con.commit()
+    except Exception as error:  # noqa: BLE001 - se muestra al usuario y no se pierde nada guardado antes
+        con.rollback()
+        st.session_state["error_nomina"] = str(error)
+    st.session_state[f"v_{clave}"] = _version(clave) + 1
+    st.session_state["aviso"] = "Nómina actualizada ✔"
+
+
+def editor_nomina(con, cid, periodo, rol, cerrado):
+    tabla = tabla_nomina(con, cid, periodo, rol)
+    dm = calc.dias_mes(periodo)
+    clave = f"nomina_{cid}_{periodo}"
+    clave_widget = f"{clave}_{_version(clave)}"
+    if "error_nomina" in st.session_state:
+        st.error("No se pudo guardar el último cambio: " + st.session_state.pop("error_nomina"))
+    st.data_editor(
+        tabla, hide_index=True, width="stretch", key=clave_widget, placeholder="", disabled=True if cerrado else
+        ["Nº", *COLS_CALCULADAS], num_rows="fixed" if cerrado else "dynamic",
+        on_change=None if cerrado else _guardar_cambios_nomina,
+        args=None if cerrado else (con, cid, periodo, tabla, clave_widget, clave),
+        column_order=["Nº", "Nombre", "Cargo", "Cédula", "Sueldo", "Días Lab.", "Bono mov. mensual",
+                      "Otros pagos", "Ingreso", "Salida", "Descuento", *COLS_CALCULADAS, "Contrato", "Activo",
+                      "Observación"],
+        column_config={
+            "empleado_id": None,
+            "Nº": st.column_config.NumberColumn(width=40, pinned=True),
+            "Nombre": st.column_config.TextColumn(required=True, pinned=True, width="medium"),
+            "Cargo": st.column_config.TextColumn(),
+            "Cédula": st.column_config.TextColumn(),
+            "Sueldo": st.column_config.NumberColumn("Sueldo", format="$%.2f", min_value=0.0,
+                                                    help="Sueldo mensual completo"),
+            "Días Lab.": st.column_config.NumberColumn(
+                f"Días Lab. (de {dm})", min_value=0.0, max_value=float(dm), step=0.5, format="%g",
+                help=f"Días trabajados. Se calcula solo desde la fecha de ingreso hasta el día {dm} o la "
+                     "salida; escribe otro número si faltó o trabajó distinto. Bórralo para volver a automático."),
+            "Bono mov. mensual": st.column_config.NumberColumn(format="$%.2f", min_value=0.0,
+                                                               help="Bono mensual completo; se paga "
+                                                                    "proporcional a los días."),
+            "Otros pagos": st.column_config.NumberColumn(format="$%.2f", min_value=0.0,
+                                                         help="Horas extras u otro pago fijo de este mes"),
+            "Ingreso": st.column_config.DateColumn(format="DD/MM/YYYY"),
+            "Salida": st.column_config.DateColumn(format="DD/MM/YYYY"),
+            "Descuento": st.column_config.NumberColumn(format="$%.2f", min_value=0.0,
+                                                       help="Adelantos o descuentos del mes. Solo baja el "
+                                                            "valor a recibir, no el PyG."),
+            "Total gasto (PyG)": st.column_config.NumberColumn(format="$%.2f",
+                                                               help="Lo que suma al PyG del mes"),
+            "Valor a recibir": st.column_config.NumberColumn(format="$%.2f",
+                                                             help="Lo que se deposita a la persona"),
+            "Contrato": st.column_config.SelectboxColumn(options=db.TIPOS_CONTRATO, required=True,
+                                                         default=db.TIPOS_CONTRATO[0]),
+            "Activo": st.column_config.CheckboxColumn(default=True),
+            "Observación": st.column_config.TextColumn(),
+        })
+    tot = tabla[COLS_CALCULADAS + ["Descuento"]].sum()
+    st.html(f"""<div style="display:flex;flex-wrap:wrap;gap:6px 28px;justify-content:flex-end;
+                padding:8px 14px;border-radius:8px;background:#E8F8FD;font-size:15px">
+                <b style="margin-right:auto">TOTAL MANO DE OBRA</b>
+                <span>Total gasto (PyG): <b>{dinero(tot['Total gasto (PyG)'])}</b></span>
+                <span>Descuentos: <b>{dinero(tot['Descuento'])}</b></span>
+                <span>Valor a recibir: <b>{dinero(tot['Valor a recibir'])}</b></span></div>""")
+    if cerrado:
+        st.caption("Rol cerrado: la tabla queda bloqueada. Reábrelo para editar.")
+    else:
+        st.caption(f"Edita directo en la tabla: cada cambio se guarda solo y recalcula. Mes de **{dm} días**: "
+                   "Total gasto = sueldo × días ÷ días del mes + bono proporcional + otros pagos (+ beneficios de "
+                   "ley si es relación de dependencia). Para agregar a alguien usa la fila vacía del final; para "
+                   "eliminar, selecciona la fila y usa el ícono de basurero (si ya trabajó meses anteriores, "
+                   "queda inactivo y deja de contar desde este mes). Los inactivos se ordenan al final.")
 
 
 def descargas_rol(con, cid, periodo, rol):
@@ -594,30 +813,25 @@ def descargas_rol(con, cid, periodo, rol):
 def pestaña_mano_obra(con, cid, periodo, r):
     rol = r["rol"]
     cerrado = calc.rol_cerrado(con, cid, periodo)
+    dm = calc.dias_mes(periodo)
     ppto = db.presupuesto(con, cid)
     limite = r["total_ventas"] * ppto.get("Mano de Obra", 0)
+    neto = rol["Neto a pagar"].sum() if len(rol) else 0
     c = st.columns(4)
-    tarjeta(c[0], "Costo mano de obra", dinero(r["total_mo"]), f"al día {r['corte']}", "rosa")
+    tarjeta(c[0], "Total gasto (PyG)", dinero(r["total_mo"]), f"al día {r['corte']} de {dm}", "rosa")
     tarjeta(c[1], "Presupuesto", dinero(limite), porcentaje(ppto.get("Mano de Obra")) + " de ventas", "cian")
     tarjeta(c[2], "Diferencia", dinero(limite - r["total_mo"]), "a favor" if limite >= r["total_mo"] else "excedido",
             "blanco", limite - r["total_mo"])
-    tarjeta(c[3], "Neto a pagar", dinero(rol["Neto a pagar"].sum() if len(rol) else 0), "después de descuentos",
-            "negro")
+    tarjeta(c[3], "Valor a recibir", dinero(neto), "a depositar al personal", "negro")
     st.write("")
 
     if cerrado:
         st.success("Rol de este mes **cerrado**: se usan los días y sueldos guardados al cerrarlo.",
                    icon=":material/lock:")
-    if len(rol):
-        tabla_rol(rol)
-
-    if not cerrado:
-        with st.expander("✏️ Novedades del mes (días distintos, horas extras)"):
-            editor_novedades(con, cid, periodo, r["corte"])
-    with st.expander("➖ Descuentos y adelantos"):
-        editor_descuentos(con, cid, periodo)
-    with st.expander("👥 Personal (agregar, editar sueldo, fecha de salida, tipo de contrato)"):
-        editor_empleados(con, cid)
+    elif r["corte"] < dm:
+        st.info(f"Mes en curso: los días automáticos van hasta el día **{r['corte']}**. Al cerrar el rol se "
+                f"calculan los {dm} días del mes.", icon=":material/info:")
+    editor_nomina(con, cid, periodo, rol, cerrado)
 
     st.divider()
     if cerrado:
@@ -626,116 +840,13 @@ def pestaña_mano_obra(con, cid, periodo, r):
             calc.reabrir_rol(con, cid, periodo)
             _guardado(f"mo_{cid}", "Rol reabierto")
     else:
-        st.write("Al terminar el mes, **cierra el rol**: guarda una foto de días y sueldos, así un aumento futuro "
-                 "no cambia meses pasados.")
-        if st.button(f"🔒 Cerrar rol de {calc.nombre_mes(periodo)}", disabled=r["corte"] < 30 and
-                     calc.dia_corte(periodo) < 30, help="Se habilita cuando el mes terminó."):
+        st.write(f"Al terminar el mes, **cierra el rol**: guarda una foto de días, sueldos y descuentos con el "
+                 f"**valor a recibir** de cada persona (lo que hay que depositar), así un aumento futuro no cambia "
+                 f"meses pasados.")
+        if st.button(f"🔒 Cerrar rol de {calc.nombre_mes(periodo)}", disabled=calc.dia_corte(periodo) < dm,
+                     help="Se habilita cuando el mes terminó."):
             calc.cerrar_rol(con, cid, periodo)
             _guardado(f"mo_{cid}", "Rol cerrado ✔")
-
-
-def editor_novedades(con, cid, periodo, corte):
-    emp = db.df(con, "SELECT id, nombre, cargo FROM empleados WHERE cliente_id=? AND activo=1 ORDER BY id", (cid,))
-    nov = db.df(con, "SELECT * FROM novedades_rol WHERE periodo=?", (periodo,)).set_index("empleado_id")
-    tabla = pd.DataFrame({
-        "empleado_id": emp["id"], "Nombre": emp["nombre"], "Cargo": emp["cargo"],
-        "Días (vacío = automático)": [nov.loc[i, "dias"] if i in nov.index else None for i in emp["id"]],
-        "Horas extras / otros pagos": [nov.loc[i, "extras"] if i in nov.index else 0.0 for i in emp["id"]],
-        "Observación": [nov.loc[i, "observacion"] if i in nov.index else None for i in emp["id"]],
-    })
-    clave = f"nov_{cid}_{periodo}"
-    st.caption(f"Automático = días desde el ingreso hasta el día {corte} (o hasta la fecha de salida). "
-               "Pon un número solo si faltó o trabajó distinto.")
-    editado = st.data_editor(tabla, hide_index=True, width="stretch", key=f"{clave}_{_version(clave)}",
-                             column_config={"empleado_id": None,
-                                            "Nombre": st.column_config.TextColumn(disabled=True),
-                                            "Cargo": st.column_config.TextColumn(disabled=True),
-                                            "Días (vacío = automático)": st.column_config.NumberColumn(min_value=0,
-                                                                                                       max_value=30),
-                                            "Horas extras / otros pagos": DINERO})
-    if st.button("💾 Guardar novedades", key=f"g_{clave}"):
-        for _, f in editado.iterrows():
-            dias, extras, obs = (db.limpio(f["Días (vacío = automático)"]), db.limpio(f["Horas extras / otros pagos"]),
-                                 db.limpio(f["Observación"]))
-            if dias is None and not extras and not obs:
-                con.execute("DELETE FROM novedades_rol WHERE empleado_id=? AND periodo=?",
-                            (int(f["empleado_id"]), periodo))
-            else:
-                con.execute("""INSERT INTO novedades_rol (empleado_id, periodo, dias, extras, observacion)
-                               VALUES (?,?,?,?,?) ON CONFLICT(empleado_id, periodo) DO UPDATE SET
-                               dias=excluded.dias, extras=excluded.extras, observacion=excluded.observacion""",
-                            (int(f["empleado_id"]), periodo, dias, extras or 0, obs))
-        con.commit()
-        _guardado(clave)
-
-
-def editor_descuentos(con, cid, periodo):
-    emp = db.df(con, "SELECT id, nombre, cargo, activo FROM empleados WHERE cliente_id=? ORDER BY activo DESC, nombre",
-                (cid,))
-    etiqueta = {i: f"{n} ({c})" for i, n, c in zip(emp["id"], emp["nombre"], emp["cargo"])}
-    datos = db.df(con, """SELECT d.id, d.empleado_id, d.periodo_inicio, d.tipo, d.motivo, d.monto_total, d.cuotas
-                          FROM descuentos d JOIN empleados e ON e.id=d.empleado_id WHERE e.cliente_id=?
-                          ORDER BY d.periodo_inicio DESC, d.id""", (cid,))
-    datos.insert(1, "Empleado", datos["empleado_id"].map(etiqueta))
-    datos = datos.drop(columns=["empleado_id"])
-    st.caption("Los descuentos son solo de manejo interno: bajan lo que se le paga al trabajador, pero **no "
-               "cambian el PyG**. Lo que la empresa compró por él (ej. zapatos) se registra en Gastos varios. "
-               "Un descuento en varias cuotas se reparte solo en los meses siguientes.")
-    clave = f"desc_{cid}"
-    editado = st.data_editor(
-        datos, hide_index=True, width="stretch", num_rows="dynamic", key=f"{clave}_{_version(clave)}",
-        column_config={
-            "id": None,
-            "Empleado": st.column_config.SelectboxColumn(options=list(etiqueta.values()), required=True),
-            "periodo_inicio": st.column_config.TextColumn("Desde (AAAA-MM)", default=periodo, required=True,
-                                                         validate=r"^\d{4}-\d{2}$"),
-            "tipo": st.column_config.SelectboxColumn("Tipo", options=db.TIPOS_DESCUENTO, required=True,
-                                                     default=db.TIPOS_DESCUENTO[0]),
-            "motivo": st.column_config.TextColumn("Motivo"),
-            "monto_total": st.column_config.NumberColumn("Monto total", format="$%.2f", min_value=0.0),
-            "cuotas": st.column_config.NumberColumn("Cuotas (meses)", min_value=1, step=1, default=1),
-        })
-    if st.button("💾 Guardar descuentos", key=f"g_{clave}"):
-        inverso = {v: k for k, v in etiqueta.items()}
-        e = editado.assign(empleado_id=editado["Empleado"].map(inverso), cuotas=editado["cuotas"].fillna(1))
-        db.guardar_editor(con, "descuentos", e, datos["id"].tolist(),
-                          ["empleado_id", "periodo_inicio", "tipo", "motivo", "monto_total", "cuotas"],
-                          fila_valida=lambda d: d["empleado_id"] and d["monto_total"] and d["periodo_inicio"])
-        _guardado(clave)
-
-
-def editor_empleados(con, cid):
-    datos = db.df(con, """SELECT id, cedula, nombre, cargo, sueldo, bono, tipo_contrato, fecha_ingreso, fecha_salida,
-                          activo FROM empleados WHERE cliente_id=? ORDER BY activo DESC, id""", (cid,))
-    for c in ("fecha_ingreso", "fecha_salida"):
-        datos[c] = _a_fecha(datos[c])
-    datos["activo"] = datos["activo"].fillna(1).astype(bool)
-    clave = f"emp_{cid}"
-    editado = st.data_editor(
-        datos, hide_index=True, width="stretch", num_rows="dynamic", key=f"{clave}_{_version(clave)}",
-        column_config={
-            "id": None, "cedula": "Cédula", "nombre": st.column_config.TextColumn("Nombre", required=True),
-            "cargo": "Cargo", "sueldo": st.column_config.NumberColumn("Sueldo mensual", format="$%.2f", min_value=0.0),
-            "bono": st.column_config.NumberColumn("Bono mensual", format="$%.2f", min_value=0.0, default=0.0),
-            "tipo_contrato": st.column_config.SelectboxColumn("Contrato", options=db.TIPOS_CONTRATO,
-                                                              default=db.TIPOS_CONTRATO[0], required=True),
-            "fecha_ingreso": st.column_config.DateColumn("Ingreso", format="DD/MM/YYYY"),
-            "fecha_salida": st.column_config.DateColumn("Salida", format="DD/MM/YYYY"),
-            "activo": st.column_config.CheckboxColumn("Activo", default=True),
-        })
-    st.caption("**Relación de dependencia** suma aporte patronal IESS, décimos, vacaciones y fondos de reserva. "
-               "**Prestación de servicios** solo suma sueldo y bono. Al poner fecha de salida, deja de contar "
-               "desde ese día.")
-    if st.button("💾 Guardar personal", key=f"g_{clave}"):
-        e = editado.copy()
-        for c in ("fecha_ingreso", "fecha_salida"):
-            e[c] = e[c].map(db.a_texto_fecha)
-        e["activo"] = e["activo"].fillna(True).astype(int)
-        e["bono"] = e["bono"].fillna(0)
-        db.guardar_editor(con, "empleados", e, datos["id"].tolist(),
-                          ["cedula", "nombre", "cargo", "sueldo", "bono", "tipo_contrato", "fecha_ingreso",
-                           "fecha_salida", "activo"], {"cliente_id": cid}, lambda d: d["nombre"])
-        _guardado(clave)
 
 
 # ================================================================ por pagar
