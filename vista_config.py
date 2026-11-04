@@ -234,7 +234,8 @@ def clientes(con):
 
 def proveedores(con):
     cats = db.categorias(con)
-    datos = db.df(con, """SELECT p.id, c.nombre AS grupo, p.nombre, p.producto, p.telefono, p.notas, p.activo
+    datos = db.df(con, """SELECT p.id, c.nombre AS grupo, p.nombre, p.producto, p.dias_cobertura, p.grupo_control,
+                                 p.telefono, p.notas, p.activo
                           FROM proveedores p LEFT JOIN categorias c ON c.id=p.categoria_id
                           ORDER BY p.activo DESC, c.orden, p.nombre""")
     datos["activo"] = datos["activo"].fillna(1).astype(bool)
@@ -248,14 +249,24 @@ def proveedores(con):
                             "grupo": st.column_config.SelectboxColumn("Bodega", options=list(cats["nombre"]),
                                                                       required=True),
                             "nombre": st.column_config.TextColumn("Proveedor", required=True),
-                            "producto": "Producto", "telefono": "Teléfono", "notas": "Notas",
+                            "producto": "Producto",
+                            "dias_cobertura": st.column_config.NumberColumn(
+                                "Días que cubre el pedido", min_value=1, max_value=31, step=1, default=7,
+                                help="1 = se consume el mismo día (pan). 7 = pedido semanal (martes/miércoles "
+                                     "para jueves a miércoles). 14 = pedido cada 15 días (pulpas)."),
+                            "grupo_control": st.column_config.TextColumn(
+                                "Control semanal",
+                                help="Nombre de la fila en el control de pedidos. Dos proveedores con el mismo "
+                                     "nombre se reemplazan entre sí (ej. Hernández o San José). Vacío = eventual."),
+                            "telefono": "Teléfono", "notas": "Notas",
                             "activo": st.column_config.CheckboxColumn("Activo", default=True)})
     if st.button("Guardar proveedores", icon=":material/save:", key=f"g_{clave}"):
         e = ed.assign(categoria_id=ed["grupo"].map(dict(zip(cats["nombre"], cats["id"]))),
                       activo=ed["activo"].fillna(True).astype(int))
         try:
             db.guardar_editor(con, "proveedores", e, datos["id"].tolist(),
-                              ["nombre", "categoria_id", "producto", "telefono", "notas", "activo"],
+                              ["nombre", "categoria_id", "producto", "dias_cobertura", "grupo_control", "telefono",
+                               "notas", "activo"],
                               fila_valida=lambda d: d["nombre"])
             _guardado(clave)
         except Exception:
